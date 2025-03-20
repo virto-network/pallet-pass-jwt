@@ -115,7 +115,6 @@ pub fn get_sub(token: &TokenData<Claims>) -> Result<String, Error> {
 // }
 
 // JWKs|JWK auxiliar functions
-
 pub fn get_jwk(jwt_kid: &String, jwks: &JwkSet) -> Result<Jwk, Error> {
     let jwk = jwks
         .keys
@@ -126,10 +125,6 @@ pub fn get_jwk(jwt_kid: &String, jwks: &JwkSet) -> Result<Jwk, Error> {
         None => Err(Error::NoJwkForKid),
     };
     res
-}
-
-pub fn get_crypto_pub_key() -> Result<DecodingKey, Error> {
-    todo!()
 }
 
 pub fn verify_jwt(token: TokenData<Claims>, jwks: JwkSet) -> Result<bool, Error> {
