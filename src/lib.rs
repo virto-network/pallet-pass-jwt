@@ -38,16 +38,11 @@ struct SerializableTokenData<'a> {
     claims: &'a Claims,
 }
 
-fn get_public_key(kid: &str, jwks: &JwkSet) -> Result<DecodingKey, Error> {
+fn get_public_key(kid: &str, jwk: &Jwk) -> Result<DecodingKey, Error> {
     // Search the kid in the jwks
     let res: Result<DecodingKey, Error>;
 
-    let jwk = jwks
-        .keys
-        .iter()
-        .find(|jwk| jwk.common.key_id.as_ref().map_or(false, |id| id == kid));
-
-    res = match &jwk.unwrap().algorithm {
+    res = match &jwk.algorithm {
         AlgorithmParameters::RSA(rsa_params) => {
             Ok(DecodingKey::from_rsa_components(&rsa_params.n, &rsa_params.e).unwrap())
         }
@@ -122,12 +117,15 @@ pub fn get_sub(token: &TokenData<Claims>) -> Result<String, Error> {
 // JWKs|JWK auxiliar functions
 
 pub fn get_jwk(jwt_kid: &String, jwks: &JwkSet) -> Result<Jwk, Error> {
-    for jwk_item in &jwks.keys {
-        if jwk_item.common.key_id.clone().unwrap() == *jwt_kid {
-            return Ok(jwk_item.clone());
-        }
-    }
-    Err(Error::NoJwkForKid)
+    let jwk = jwks
+        .keys
+        .iter()
+        .find(|jwk| jwk.common.key_id.as_ref().map_or(false, |id| id == jwt_kid));
+    let res = match jwk {
+        Some(json_web_key) => Ok(json_web_key.clone()),
+        None => Err(Error::NoJwkForKid),
+    };
+    res
 }
 
 pub fn get_crypto_pub_key() -> Result<DecodingKey, Error> {
@@ -144,9 +142,7 @@ pub fn verify_jwt(token: TokenData<Claims>, jwks: JwkSet) -> Result<bool, Error>
 
     // Get JWK info
     let jwk = get_jwk(&jwt_kid, &jwks)?;
-
-    let decode_key = get_public_key(&jwt_kid, &jwks)?;
-
+    let decode_key = get_public_key(&jwt_kid, &jwk)?;
     // let res = verify(signature, message, &decode_key, jsonwebtoken::Algorithm::RS256)?;
 
     todo!()
