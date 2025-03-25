@@ -2,7 +2,6 @@ use jsonwebtoken::crypto::verify;
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, Header, TokenData, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
-use serde_json::{self};
 
 pub enum ErrorInJwt {
     InvalidJwt,
@@ -35,36 +34,15 @@ pub struct Claims {
     pub iss: String,
 }
 
-#[derive(Debug, Serialize)]
-struct SerializableTokenData<'a> {
-    header: &'a jsonwebtoken::Header,
-    claims: &'a Claims,
-}
-
 fn get_public_key(jwk: &Jwk) -> Result<DecodingKey, ErrorInJwt> {
     // Search the kid in the jwks
-    let res: Result<DecodingKey, ErrorInJwt>;
-
-    res = match &jwk.algorithm {
+    let res = match &jwk.algorithm {
         AlgorithmParameters::RSA(rsa_params) => {
             Ok(DecodingKey::from_rsa_components(&rsa_params.n, &rsa_params.e).unwrap())
         }
-
         _ => Err(ErrorInJwt::NotPossibleToGetDecodeKey),
     };
     res
-}
-
-pub fn check_token(token: &TokenData<Claims>) -> Result<String, ErrorInJwt> {
-    let serializable = SerializableTokenData {
-        header: &token.header,
-        claims: &token.claims,
-    };
-
-    match serde_json::to_string(&serializable) {
-        Ok(json) => Ok(json),
-        Err(_) => Err(ErrorInJwt::InvalidJson),
-    }
 }
 
 pub fn get_kid_from_token(the_header: &Header) -> Result<String, ErrorInJwt> {
@@ -72,19 +50,6 @@ pub fn get_kid_from_token(the_header: &Header) -> Result<String, ErrorInJwt> {
         Some(kid) if !kid.is_empty() => Ok(kid.clone()),
         Some(_) => Err(ErrorInJwt::InvalidToken),
         None => Err(ErrorInJwt::InvalidToken),
-    }
-}
-
-pub fn has_token_expired(token: &TokenData<Claims>) -> Result<(), ErrorInJwt> {
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ErrorInJwt::InvalidToken)?
-        .as_secs();
-
-    if current_time < token.claims.exp {
-        Ok(())
-    } else {
-        Err(ErrorInJwt::TokenExpired)
     }
 }
 
@@ -107,27 +72,13 @@ pub fn get_sub(token: &TokenData<Claims>) -> Result<String, ErrorInJwt> {
     res
 }
 
-// Not sure if needed
-// pub fn get_signature(token: &TokenData<Claims>) -> Result<String, Error> {
-//     let res = if token. {
-//         Err(ErrorInJwt::NoSub)
-//     } else {
-//         Ok(token.claims.sub.clone())
-//     };
-//     res
-// }
-
 // JWKs|JWK auxiliar functions
-pub fn get_jwk(jwt_kid: &String, jwks: &JwkSet) -> Result<Jwk, ErrorInJwt> {
-    let jwk = jwks
+pub fn get_jwk(jwt_kid: &String, jwks: &JwkSet) -> Option<Jwk> {
+    jwks
         .keys
         .iter()
-        .find(|jwk| jwk.common.key_id.as_ref().map_or(false, |id| id == jwt_kid));
-    let res = match jwk {
-        Some(json_web_key) => Ok(json_web_key.clone()),
-        None => Err(ErrorInJwt::NoJwkForKid),
-    };
-    res
+        .find(|jwk| jwk.common.key_id.as_ref().map_or(false, |id| id == jwt_kid))
+        .map(|jwk| jwk.clone())
 }
 
 pub fn get_signature(token: &str) -> Result<String, ErrorInJwt> {
@@ -146,17 +97,14 @@ pub fn get_message(token: &str) -> Result<String, ErrorInJwt> {
     }
 }
 
-pub fn verify_jwt(token: &str, jwks: JwkSet) -> Result<bool, ErrorInJwt> {
+pub fn verify_jwt(token: &str, jwks: &JwkSet) -> Result<bool, ErrorInJwt> {
     let token_header = decode_header(token).unwrap(); // ToDo Handle error
     let jwt_kid = get_kid_from_token(&token_header)?;
-    let jwk = get_jwk(&jwt_kid, &jwks)?;
+    let jwk = get_jwk(&jwt_kid, &jwks).ok_or(ErrorInJwt::NoJwkForKid)?;
     let decode_key = get_public_key(&jwk)?;
     let token_data =
         decode::<Claims>(token, &decode_key, &Validation::new(Algorithm::RS256)).unwrap(); // ToDo Handle error
     // Get JWT info
-    check_token(&token_data)?;
-
-    has_token_expired(&token_data)?;
     let _issuer = get_issuer(&token_data)?;
     let _subs = get_sub(&token_data)?;
 
@@ -164,14 +112,10 @@ pub fn verify_jwt(token: &str, jwks: JwkSet) -> Result<bool, ErrorInJwt> {
     let signature = get_signature(&token)?;
     let message = get_message(&token)?;
     // Get JWK info
-    let res = verify(
+    verify(
         &signature,
         message.as_bytes(),
         &decode_key,
         jsonwebtoken::Algorithm::RS256,
-    );
-    match res {
-        Ok(x) => Ok(x),
-        _ => Err(ErrorInJwt::ErrorVerifying),
-    }
+    ).map_err(|_| ErrorInJwt::ErrorVerifying)
 }
