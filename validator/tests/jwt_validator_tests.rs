@@ -1,19 +1,18 @@
 use jsonwebtoken::jwk::{
-    AlgorithmParameters, CommonParameters, Jwk, JwkSet, RSAKeyParameters, RSAKeyType, KeyAlgorithm
+    AlgorithmParameters, CommonParameters, Jwk, JwkSet, KeyAlgorithm, RSAKeyParameters, RSAKeyType,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, TokenData, encode};
 // use serde_json::json;
 // use std::collections::HashMap;
-use rsa::*;
 use jwt_validator::*;
-
+use rsa::*;
 
 // Correct values
 // p=61 q=53 n=p*q=3233
 // phi(n) =(p-1)(q-1)=3120
 // e=17 d=2753
-fn create_correct_values () -> JwkSet {
-    let  correct_jwk_1:Jwk = Jwk{
+fn create_correct_values() -> JwkSet {
+    let correct_jwk_1: Jwk = Jwk {
         common: CommonParameters {
             key_algorithm: Some(KeyAlgorithm::RS256),
             key_id: Some("ee193d4647ab4a3585aa9b2b3b484a87aa68bb42".to_string()),
@@ -26,7 +25,7 @@ fn create_correct_values () -> JwkSet {
         }),
     };
 
-    let  correct_jwk_2:Jwk = Jwk{
+    let correct_jwk_2: Jwk = Jwk {
         common: CommonParameters {
             key_algorithm: Some(KeyAlgorithm::RS256),
             key_id: Some("ff204d4647ab4a3585aa9b2b3b484a87aa68cc37".to_string()),
@@ -38,16 +37,13 @@ fn create_correct_values () -> JwkSet {
             e: "17".to_string(),
         }),
     };
-    JwkSet{
+    JwkSet {
         keys: vec![correct_jwk_1, correct_jwk_2],
     }
-
-    
-
 }
 // Incorrect values
 
-fn create_test_claims(exp: u64) -> Claims {    
+fn create_test_claims(exp: u64) -> Claims {
     Claims {
         aud: "test_audience".into(),
         sub: "user123".into(),
@@ -132,13 +128,16 @@ fn test_get_kid_from_token_empty() {
 fn test_get_issuer_and_sub() {
     let claims = create_test_claims(9999999999);
     let header = Header::default();
-    let token_data = TokenData {
-        claims,
-        header,
-    };
+    let token_data = TokenData { claims, header };
 
-    assert_eq!(get_issuer(&token_data).unwrap_or(String::from("error")), "test_issuer");
-    assert_eq!(get_sub(&token_data).unwrap_or(String::from("error")), "user123");
+    assert_eq!(
+        get_issuer(&token_data).unwrap_or(String::from("error")),
+        "test_issuer"
+    );
+    assert_eq!(
+        get_sub(&token_data).unwrap_or(String::from("error")),
+        "user123"
+    );
 }
 
 #[test]
@@ -147,10 +146,7 @@ fn test_get_issuer_and_sub_empty() {
     claims.iss = "".to_string();
     claims.sub = "".to_string();
     let header = Header::default();
-    let token_data = TokenData {
-        claims,
-        header,
-    };
+    let token_data = TokenData { claims, header };
 
     assert!(matches!(get_issuer(&token_data), Err(ErrorInJwt::NoIssuer)));
     assert!(matches!(get_sub(&token_data), Err(ErrorInJwt::NoSub)));
@@ -165,12 +161,7 @@ fn test_get_signature_and_message() {
 
 #[test]
 fn test_get_signature_and_message_invalid() {
-    let invalid_tokens = vec![
-        "",
-        "aaa",
-        "aaa.bbb",
-        "aaa.bbb.ccc.ddd",
-    ];
+    let invalid_tokens = vec!["", "aaa", "aaa.bbb", "aaa.bbb.ccc.ddd"];
 
     for token in invalid_tokens {
         assert_eq!(get_signature(token), None);
@@ -199,12 +190,10 @@ fn test_get_jwk_failure() {
 #[test]
 fn test_verify_jwt_success() {
     let n = "3233"; // Example RSA modulus
-    let e = "17";   // Example RSA public exponent
+    let e = "17"; // Example RSA public exponent
     let kid = "test_kid";
     let jwk = create_test_jwk(kid, n, e);
-    let jwks = JwkSet {
-        keys: vec![jwk],
-    };
+    let jwks = JwkSet { keys: vec![jwk] };
 
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
@@ -224,7 +213,7 @@ fn test_verify_jwt_success() {
 #[test]
 fn test_verify_jwt_failures() {
     let jwks = JwkSet { keys: vec![] };
-    
+
     // Test invalid JWT format
     assert!(matches!(
         verify_jwt("invalid.jwt.format", &jwks),
