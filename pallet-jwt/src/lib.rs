@@ -35,12 +35,8 @@ pub mod pallet {
     pub struct Pallet<T>(_);
 
     #[pallet::storage]
-    pub type StorageMap<T: Config> = StorageValue<
-        _,
-        BlakeTwo256,
-        IssuerId,
-        Option<(T::AccountId, T::Balance)>,
-    >;
+    pub type StorageMap<T: Config> =
+        StorageValue<_, BlakeTwo256, IssuerId, Option<(T::AccountId, T::Balance)>>;
 
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -79,7 +75,6 @@ pub mod pallet {
             origin: OriginFor<T>,
             name: String,
             url: String,
-            
         ) -> DispatchResultWithPostInfo {
             let who = ensure_signed(origin)?;
             // let deposit_base: T::MetadataDepositBase;
@@ -92,7 +87,7 @@ pub mod pallet {
 
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::default())]
-        pub fn set_keys(origin: OriginFor<T>, keys: Vec<T::key> ) -> DispatchResultWithPostInfo {
+        pub fn set_keys(origin: OriginFor<T>, keys: Vec<T::key>) -> DispatchResultWithPostInfo {
             // Check the origin of the call is a signed user.
             let who = ensure_signed(origin)?;
 
@@ -104,15 +99,11 @@ pub mod pallet {
 
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::default())]
-        pub fn destroy(origin: OriginFor<T>, issuer: T::issuer ) -> DispatchResultWithPostInfo {
+        pub fn destroy(origin: OriginFor<T>, issuer: T::issuer) -> DispatchResultWithPostInfo {
             // Check the origin of the call is a signed user.
             let who = ensure_signed(origin)?;
 
-            
-
             Ok(().into())
         }
-
-        
     }
 }

@@ -1,7 +1,7 @@
 # Workspace
 [workspace]
 resolver = "2"
-members = [ "pallet-jwt","validator"]
+members = ["pallet-jwt", "validator"]
 
 # Package info
 [workspace.package]
@@ -14,26 +14,31 @@ repository = "https://github.com/virto-network/pallet-pass-jwt.git"
 # Dependencies
 
 [workspace.dependencies]
-jsonwebtoken = {version="9.3.1"}
-serde = {version = "1.0.219", features = ["derive"]}
-rsa = { version = "0.9.8"}
+jsonwebtoken = { version = "9.3.1" }
+serde = { version = "1.0.219", features = ["derive"] }
+rsa = { version = "0.9.8" }
 base64 = "0.22"
-rand = "0.9.0"
+rand = "0.9.1"
 log = { version = "0.4.22", default-features = false }
 
 
 # FRAME
-codec = { package = "parity-scale-codec", version = "3.6.12", default-features = false, features = [
+codec = { package = "parity-scale-codec", version = "3.7.4", default-features = false, features = [
   "derive",
 ] }
-scale-info = { version = "2.11.3", default-features = false, features = [
+scale-info = { version = "2.11.6", default-features = false, features = [
   "derive",
 ] }
-frame-support = { git = "https://github.com/virto-network/polkadot-sdk", branch = "release-virto-stable2409", default-features = false }
-frame-system = { git = "https://github.com/virto-network/polkadot-sdk", branch = "release-virto-stable2409", default-features = false }
-pallet-balances = { git = "https://github.com/virto-network/polkadot-sdk", branch = "release-virto-stable2409", default-features = false }
-sp-io = { git = "https://github.com/virto-network/polkadot-sdk", branch = "release-virto-stable2409", default-features = false }
-sp-runtime = { git = "https://github.com/virto-network/polkadot-sdk", branch = "release-virto-stable2409", default-features = false }
+frame-support = { version = "40.1.0", default-features = false }
+frame-system = { version = "40.1.0", default-features = false }
+frame = { version = "0.9.1", package = "polkadot-sdk-frame", default-features = false, features = [
+  "experimental",
+  "runtime",
+] }
+pallet-balances = { version = "41.1.0", default-features = false }
+sp-io = { version = "40.0.0", default-features = false }
+sp-runtime = { version = "41.1.0", default-features = false }
+sp-core = "36.1.0"
 
 # FRAME Contrib
 traits-authn = { git = "https://github.com/virto-network/frame-contrib", package = "fc-traits-authn", default-features = false }
