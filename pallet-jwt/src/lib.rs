@@ -1,6 +1,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 pub use pallet::*;
+use frame_support::{BoundedVec, ensure, traits::Get, dispatch::DispatchResult};
+use frame_system::pallet_prelude::*;
+use sp_runtime::traits::AtLeast32BitUnsigned;
 
 #[frame::pallet]
 pub mod pallet {
@@ -219,6 +222,7 @@ pub mod pallet {
         IssuerUpdateIntervalBelowMin, // To Do: Is this needed?
         IssuerUpdateIntervalNotMultipleOfBlock,
         IssuerOpenIdURLOrJWKSNotProvided,
+        IssuerUpdated,
         OnlyGovernanceCanUpdateIssuer,
         OnlyGovernanceCanDeleteIssuer,
         InvalidJsonFormatForJWKS,
@@ -249,53 +253,15 @@ pub mod pallet {
             // ensure_root(origin)?;
             let who = ensure_signed(origin)?;
 
-            ensure!(
-                name.len() <= T::MaxLengthIssuerName::get() as usize,
-                Error::<T>::IssuerNameTooLong
-            );
-
-            ensure!(
-                domain.len() <= T::MaxLengthIssuerDomain::get() as usize,
-                Error::<T>::IssuerDomainTooLong
-            );
-
-            // Ensure open_id_url or jwks is provided
-            ensure!(
-                open_id_url.is_some() || jwks.is_some(),
-                Error::<T>::IssuerOpenIdURLOrJWKSNotProvided
-            );
-
-            if let Some(open_id_url) = &open_id_url {
-                ensure!(
-                    open_id_url.len() <= T::MaxLengthIssuerOpenIdURL::get() as usize,
-                    Error::<T>::IssuerOpenIdURLTooLong
-                );
-            }
-
-            if let Some(jwks) = &jwks {
-                ensure!(
-                    jwks.len() <= T::MaxLengthIssuerJWKS::get() as usize,
-                    Error::<T>::IssuerJWKSTooLong
-                );
-            }
-
-            // Ensure the update interval is a multiple of the block number
-            ensure!(
-                update_interval % frame_system::Pallet::<T>::block_number() == 0u32.into(), // ToDo: check with team
-                Error::<T>::IssuerUpdateIntervalNotMultipleOfBlock
-            );
-
-            // Ensure the update interval is not above the max
-            ensure!(
-                update_interval <= T::MaxUpdateInterval::get().into(), // ToDo: check with team
-                Error::<T>::IssuerUpdateIntervalAboveMax
-            );
-
-            // Ensure the update interval is not below the min
-            ensure!(
-                update_interval >= T::MinUpdateInterval::get().into(), // ToDo: check with team
-                Error::<T>::IssuerUpdateIntervalBelowMin
-            );
+            Self::validate_all(
+                &name,
+                &domain,
+                &open_id_url,
+                &jwks,
+                &update_interval,
+                &auto_update,
+                &status,
+            )?;
 
             // Create the issuer
             let issuer = Issuer {
@@ -315,46 +281,44 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Increment the counter by a specified amount.
-        ///
-        /// This function can be called by any signed account.
-        ///
-        /// - `amount_to_increment`: The amount by which to increment the counter.
-        ///
-        /// Emits `CounterIncremented` event when successful.
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::default())]
-        pub fn increment(origin: OriginFor<T>, amount_to_increment: u32) -> DispatchResult {
-            let who = ensure_signed(origin)?;
+        pub fn update_issuer(
+            origin: OriginFor<T>,
+            name: BoundedVec<u8, T::MaxLengthIssuerName>,
+            domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
+            open_id_url: Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
+            jwks: Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
+            update_interval: BlockNumberFor<T>,
+            auto_update: bool,
+            status: bool,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the issuer
 
-            let current_value = CounterValue::<T>::get().unwrap_or(0);
+            Self::validate_all(
+                &name,
+                &domain,
+                &open_id_url,
+                &jwks,
+                &update_interval,
+                &auto_update,
+                &status,
+            )?;
 
-            let new_value = current_value
-                .checked_add(amount_to_increment)
-                .ok_or(Error::<T>::CounterOverflow)?;
+            // Create the issuer
+            let issuer = Issuer {
+                name: name.clone(),
+                domain,
+                open_id_url,
+                jwks,
+                update_interval,
+                auto_update,
+                status,
+            };
 
-            ensure!(
-                new_value <= T::CounterMaxValue::get(),
-                Error::<T>::CounterValueExceedsMax
-            );
+            IssuerMap::<T>::insert(&name, issuer);
 
-            CounterValue::<T>::put(new_value);
-
-            UserInteractions::<T>::try_mutate(&who, |interactions| -> Result<_, Error<T>> {
-                let new_interactions = interactions
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or(Error::<T>::UserInteractionOverflow)?;
-                *interactions = Some(new_interactions); // Store the new value.
-
-                Ok(())
-            })?;
-
-            Self::deposit_event(Event::<T>::CounterIncremented {
-                counter_value: new_value,
-                who,
-                incremented_amount: amount_to_increment,
-            });
+            Self::deposit_event(Event::<T>::IssuerUpdated { who, name });
 
             Ok(())
         }
@@ -398,5 +362,85 @@ pub mod pallet {
             Ok(())
         }
         // </Example of call>
+    }
+}
+
+impl<T: Config> Pallet<T> {
+    fn validate_issuer_name(name: &BoundedVec<u8, T::MaxLengthIssuerName>) -> DispatchResult {
+        ensure!(
+            name.len() <= T::MaxLengthIssuerName::get() as usize,
+            Error::<T>::IssuerNameTooLong
+        );
+        Ok(())
+    }
+
+    fn validate_issuer_domain(domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>) -> DispatchResult {
+        ensure!(
+            domain.len() <= T::MaxLengthIssuerDomain::get() as usize,
+            Error::<T>::IssuerDomainTooLong
+        );
+        Ok(())
+    }
+
+    fn validate_issuer_open_id_url(
+        open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
+    ) -> DispatchResult {
+        if let Some(open_id_url) = open_id_url {    
+            ensure!(
+                open_id_url.len() <= T::MaxLengthIssuerOpenIdURL::get() as usize,
+                Error::<T>::IssuerOpenIdURLTooLong
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_issuer_jwks(jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>) -> DispatchResult {
+        if let Some(jwks) = jwks {
+            ensure!(
+                jwks.len() <= T::MaxLengthIssuerJWKS::get() as usize,
+                Error::<T>::IssuerJWKSTooLong
+            );
+        }
+        Ok(())  
+    }
+
+    fn validate_issuer_open_id_url_or_jwks(
+        open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
+        jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
+    ) -> DispatchResult {
+        Self::validate_issuer_open_id_url(&open_id_url)?;
+        Self::validate_issuer_jwks(&jwks)?;
+        Ok(())
+    }
+
+    fn validate_update_interval(update_interval: &BlockNumberFor<T>) -> DispatchResult {
+        // Ensure the update interval is not above the max
+        ensure!(
+            *update_interval <= T::MaxUpdateInterval::get().into(),
+            Error::<T>::IssuerUpdateIntervalAboveMax
+        );
+
+        // Ensure the update interval is not below the min
+        ensure!(
+            *update_interval >= T::MinUpdateInterval::get().into(),
+            Error::<T>::IssuerUpdateIntervalBelowMin
+        );
+        Ok(())
+    }
+
+    fn validate_all(
+        name: &BoundedVec<u8, T::MaxLengthIssuerName>,
+        domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
+        open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
+        jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
+        update_interval: &BlockNumberFor<T>,
+        _auto_update: &bool,
+        _status: &bool,
+    ) -> DispatchResult {
+        Self::validate_issuer_name(name)?;
+        Self::validate_issuer_domain(domain)?;
+        Self::validate_issuer_open_id_url_or_jwks(open_id_url, jwks)?;
+        Self::validate_update_interval(update_interval)?;
+        Ok(())
     }
 }
