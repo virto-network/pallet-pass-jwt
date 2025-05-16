@@ -1,8 +1,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-pub use pallet::*;
-use frame_support::{BoundedVec, ensure, traits::Get, dispatch::DispatchResult};
+use frame_support::{BoundedVec, dispatch::DispatchResult, ensure, traits::Get};
 use frame_system::pallet_prelude::*;
+use log::info;
+pub use pallet::*;
 use sp_runtime::traits::AtLeast32BitUnsigned;
 
 #[frame::pallet]
@@ -13,19 +14,12 @@ pub mod pallet {
     #[pallet::pallet]
     pub struct Pallet<T>(_);
 
-    // Configuration trait for the pallet.
     #[pallet::config]
     pub trait Config: frame_system::Config {
         // Defines the event type for the pallet.
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
         type BlockNumber: From<u32> + Into<u32> + AtLeast32BitUnsigned + Copy + MaxEncodedLen;
-
-        // <Example of constant>
-        // Defines the maximum value the counter can hold.
-        #[pallet::constant]
-        type CounterMaxValue: Get<u32>;
-        // </Example of constant>
 
         #[pallet::constant]
         type MaxLengthIssuerName: Get<u32>;
@@ -79,31 +73,6 @@ pub mod pallet {
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
-        // <Example of event>
-        /// The counter value has been set to a new value by Root.
-        CounterValueSet {
-            /// The new value set.
-            counter_value: u32,
-        },
-        /// A user has successfully incremented the counter.
-        CounterIncremented {
-            /// The new value set.
-            counter_value: u32,
-            /// The account who incremented the counter.
-            who: T::AccountId,
-            /// The amount by which the counter was incremented.
-            incremented_amount: u32,
-        },
-        /// A user has successfully decremented the counter.
-        CounterDecremented {
-            /// The new value set.
-            counter_value: u32,
-            /// The account who decremented the counter.
-            who: T::AccountId,
-            /// The amount by which the counter was decremented.
-            decremented_amount: u32,
-        },
-        // </Example of event>
         IssuerRegistered {
             /// The account who registered the issuer.
             who: T::AccountId,
@@ -146,6 +115,10 @@ pub mod pallet {
         IssuerUpdateIntervalUpdated {
             /// The account who updated the issuer.
             who: T::AccountId,
+            /// The issuer name.
+            name: BoundedVec<u8, T::MaxLengthIssuerName>,
+            /// The new update interval.
+            update_interval: BlockNumberFor<T>,
         },
 
         IssuerJWKSUpdated {
@@ -162,16 +135,6 @@ pub mod pallet {
             name: BoundedVec<u8, T::MaxLengthIssuerName>,
         },
     }
-
-    // <Example of storage>
-    /// Storage for the current value of the counter.
-    #[pallet::storage]
-    pub type CounterValue<T> = StorageValue<_, u32>;
-
-    /// Storage map to track the number of interactions performed by each account.
-    #[pallet::storage]
-    pub type UserInteractions<T: Config> = StorageMap<_, Twox64Concat, T::AccountId, u32>;
-    // </Example of storage>
 
     #[pallet::storage]
     pub type IssuerMap<T: Config> =
@@ -190,25 +153,15 @@ pub mod pallet {
         _,
         (
             NMapKey<Blake2_128Concat, BoundedVec<u8, T::MaxLengthIssuerName>>, // Issuer Name
-            NMapKey<Blake2_128Concat, BoundedVec<u8, T::MaxLengthIssuerJWKS>>, // JKS
+            NMapKey<Blake2_128Concat, BoundedVec<u8, T::MaxLengthIssuerJWKS>>, // JWKS
             NMapKey<Blake2_128Concat, T::AccountId>,                           // AccountId
         ),
         (),
+        OptionQuery,
     >;
 
     #[pallet::error]
     pub enum Error<T> {
-        // <Example of error>
-        /// The counter value exceeds the maximum allowed value.
-        CounterValueExceedsMax,
-        /// The counter value cannot be decremented below zero.
-        CounterValueBelowZero,
-        /// Overflow occurred in the counter.
-        CounterOverflow,
-        /// Overflow occurred in user interactions.
-        UserInteractionOverflow,
-        // </Example of error>
-
         // Issuer errors
         IssuerAlreadyExists,
         IssuerNameTooLong,
@@ -252,6 +205,11 @@ pub mod pallet {
         ) -> DispatchResult {
             // ensure_root(origin)?;
             let who = ensure_signed(origin)?;
+
+            // Check if the issuer already exists
+            if IssuerMap::<T>::contains_key(&name) {
+                return Err(Error::<T>::IssuerAlreadyExists.into());
+            }
 
             Self::validate_all(
                 &name,
@@ -316,52 +274,208 @@ pub mod pallet {
                 status,
             };
 
-            IssuerMap::<T>::insert(&name, issuer);
+            // Update Issuer storage only if the issuer exists
+            if IssuerMap::<T>::contains_key(&name) {
+                IssuerMap::<T>::insert(&name, issuer);
+            } else {
+                return Err(Error::<T>::IssuerDoesNotExist.into());
+            }
 
             Self::deposit_event(Event::<T>::IssuerUpdated { who, name });
 
             Ok(())
         }
 
-        /// Decrement the counter by a specified amount.
-        ///
-        /// This function can be called by any signed account.
-        ///
-        /// - `amount_to_decrement`: The amount by which to decrement the counter.
-        ///
-        /// Emits `CounterDecremented` event when successful.
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::default())]
-        pub fn decrement(origin: OriginFor<T>, amount_to_decrement: u32) -> DispatchResult {
-            let who = ensure_signed(origin)?;
+        pub fn delete_issuer(
+            origin: OriginFor<T>,
+            name: BoundedVec<u8, T::MaxLengthIssuerName>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to delete the issuer
 
-            let current_value = CounterValue::<T>::get().unwrap_or(0);
+            // Validate the issuer name
+            Self::validate_issuer_name(&name)?;
 
-            let new_value = current_value
-                .checked_sub(amount_to_decrement)
-                .ok_or(Error::<T>::CounterValueBelowZero)?;
+            // Check if the issuer exists
+            if !IssuerMap::<T>::contains_key(&name) {
+                return Err(Error::<T>::IssuerDoesNotExist.into());
+            }
 
-            CounterValue::<T>::put(new_value);
+            // Delete the issuer
+            IssuerMap::<T>::remove(&name);
 
-            UserInteractions::<T>::try_mutate(&who, |interactions| -> Result<_, Error<T>> {
-                let new_interactions = interactions
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or(Error::<T>::UserInteractionOverflow)?;
-                *interactions = Some(new_interactions); // Store the new value.
+            Self::deposit_event(Event::<T>::IssuerDeleted { who, name });
 
-                Ok(())
-            })?;
+            Ok(())
+        }
 
-            Self::deposit_event(Event::<T>::CounterDecremented {
-                counter_value: new_value,
+        #[pallet::call_index(3)]
+        #[pallet::weight(Weight::default())]
+        pub fn set_update_interval(
+            origin: OriginFor<T>,
+            name: BoundedVec<u8, T::MaxLengthIssuerName>,
+            update_interval: BlockNumberFor<T>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to delete the issuer
+
+            // Validate the issuer name
+            Self::validate_issuer_name(&name)?;
+            Self::validate_update_interval(&update_interval)?;
+
+            // Check if the issuer exists
+            if !IssuerMap::<T>::contains_key(&name) {
+                return Err(Error::<T>::IssuerDoesNotExist.into());
+            }
+
+            // Update the update interval
+            IssuerMap::<T>::get(&name).unwrap().update_interval = update_interval;
+
+            Self::deposit_event(Event::<T>::IssuerUpdateIntervalUpdated {
                 who,
-                decremented_amount: amount_to_decrement,
+                name,
+                update_interval,
             });
 
             Ok(())
         }
-        // </Example of call>
+
+        #[pallet::call_index(4)]
+        #[pallet::weight(Weight::default())]
+        pub fn set_auto_update(
+            origin: OriginFor<T>,
+            name: BoundedVec<u8, T::MaxLengthIssuerName>,
+            auto_update: bool,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the auto update
+
+            // Validate the issuer name
+            Self::validate_issuer_name(&name)?;
+
+            // Check if the issuer exists
+            if !IssuerMap::<T>::contains_key(&name) {
+                return Err(Error::<T>::IssuerDoesNotExist.into());
+            }
+
+            // Update the auto update
+            IssuerMap::<T>::get(&name).unwrap().auto_update = auto_update;
+
+            Self::deposit_event(Event::<T>::IssuerAutoUpdateUpdated {
+                who,
+                name,
+                auto_update,
+            });
+
+            Ok(())
+        }
+
+        #[pallet::call_index(5)]
+        #[pallet::weight(Weight::default())]
+        pub fn set_status(
+            origin: OriginFor<T>,
+            name: BoundedVec<u8, T::MaxLengthIssuerName>,
+            status: bool,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the status
+
+            // Validate the issuer name
+            Self::validate_issuer_name(&name)?;
+
+            // Check if the issuer exists
+            if !IssuerMap::<T>::contains_key(&name) {
+                return Err(Error::<T>::IssuerDoesNotExist.into());
+            }
+
+            // Update the status
+            IssuerMap::<T>::get(&name).unwrap().status = status;
+
+            Self::deposit_event(Event::<T>::IssuerStatusUpdated { who, name, status });
+
+            Ok(())
+        }
+
+        #[pallet::call_index(6)]
+        #[pallet::weight(Weight::default())]
+        pub fn set_open_id_url(
+            origin: OriginFor<T>,
+            name: BoundedVec<u8, T::MaxLengthIssuerName>,
+            open_id_url: BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the open id url
+
+            // Validate the issuer name
+            Self::validate_issuer_name(&name)?;
+
+            // Check if the issuer exists
+            if !IssuerMap::<T>::contains_key(&name) {
+                return Err(Error::<T>::IssuerDoesNotExist.into());
+            }
+
+            // Update the open id url
+            IssuerMap::<T>::get(&name).unwrap().open_id_url = Some(open_id_url);
+
+            Self::deposit_event(Event::<T>::IssuerOpenIdURLUpdated { who, name });
+
+            Ok(())
+        }
+
+        #[pallet::call_index(7)]
+        #[pallet::weight(Weight::default())]
+        pub fn propose_jwks(
+            origin: OriginFor<T>,
+            name: BoundedVec<u8, T::MaxLengthIssuerName>,
+            jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to propose the jwks Validators only!!!
+
+            // Validate the issuer name
+            Self::validate_issuer_name(&name)?;
+
+            // Validate the jwks
+            Self::validate_issuer_jwks(&Some(jwks.clone()))?;
+
+            // Check if the issuer exists
+            if !IssuerMap::<T>::contains_key(&name) {
+                return Err(Error::<T>::IssuerDoesNotExist.into());
+            }
+
+            // Check if the jwks is already proposed
+            let jwks = jwks.clone();
+            if JksProposals::<T>::contains_key((name.clone(), jwks.clone(), who.clone())) {
+                return Err(Error::<T>::AlreadyVotedForJWKS.into());
+            }
+
+            // Propose the jwks
+            JksProposals::<T>::insert((name, jwks, who), ());
+
+            Ok(())
+        }
+
+        #[pallet::call_index(8)]
+        #[pallet::weight(Weight::default())]
+        pub fn set_jwks(
+            origin: OriginFor<T>,
+            name: BoundedVec<u8, T::MaxLengthIssuerName>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the jwks
+
+            // Validate the issuer name
+            Self::validate_issuer_name(&name)?;
+
+            // Check if the issuer exists
+            if !IssuerMap::<T>::contains_key(&name) {
+                return Err(Error::<T>::IssuerDoesNotExist.into());
+            }
+
+            let most_voted_jwks = Self::get_jwks_with_higher_count(&name);
+
+            // Insert the most voted jwks in the JksMap
+            JksMap::<T>::insert(&name, most_voted_jwks);
+
+            Self::deposit_event(Event::<T>::IssuerJWKSUpdated { who, name });
+
+            Ok(())
+        }
     }
 }
 
@@ -385,7 +499,7 @@ impl<T: Config> Pallet<T> {
     fn validate_issuer_open_id_url(
         open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
     ) -> DispatchResult {
-        if let Some(open_id_url) = open_id_url {    
+        if let Some(open_id_url) = open_id_url {
             ensure!(
                 open_id_url.len() <= T::MaxLengthIssuerOpenIdURL::get() as usize,
                 Error::<T>::IssuerOpenIdURLTooLong
@@ -394,14 +508,16 @@ impl<T: Config> Pallet<T> {
         Ok(())
     }
 
-    fn validate_issuer_jwks(jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>) -> DispatchResult {
+    fn validate_issuer_jwks(
+        jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
+    ) -> DispatchResult {
         if let Some(jwks) = jwks {
             ensure!(
                 jwks.len() <= T::MaxLengthIssuerJWKS::get() as usize,
                 Error::<T>::IssuerJWKSTooLong
             );
         }
-        Ok(())  
+        Ok(())
     }
 
     fn validate_issuer_open_id_url_or_jwks(
@@ -442,5 +558,26 @@ impl<T: Config> Pallet<T> {
         Self::validate_issuer_open_id_url_or_jwks(open_id_url, jwks)?;
         Self::validate_update_interval(update_interval)?;
         Ok(())
+    }
+
+    pub fn count_accounts_for_issuer_jwks(
+        issuer_name: BoundedVec<u8, T::MaxLengthIssuerName>,
+        issuer_jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
+    ) -> u32 {
+        let prefix = (issuer_name, issuer_jwks);
+
+        let count = JksProposals::<T>::iter_prefix(prefix).count();
+
+        count as u32
+    }
+
+    pub fn get_jwks_with_higher_count(
+        issuer_name: &BoundedVec<u8, T::MaxLengthIssuerName>,
+    ) -> BoundedVec<u8, T::MaxLengthIssuerJWKS> {
+        info!("get_jwks_with_higher_count for {:?}", issuer_name);
+        // Create empty jwks
+        let jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS> = BoundedVec::new();
+
+        jwks
     }
 }
