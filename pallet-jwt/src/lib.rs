@@ -133,7 +133,8 @@ pub mod pallet {
     >;
 
     #[pallet::storage]
-    pub type JksProposals<T: Config> = CountedStorageNMap<
+    pub type JwksProposals<T: Config> = CountedStorageNMap<
+        // ToDo: Replace this with two StorageMap or StorageDoubleMap
         _,
         (
             NMapKey<Blake2_128Concat, BoundedVec<u8, T::MaxLengthIssuerDomain>>, // Issuer Domain
@@ -144,11 +145,12 @@ pub mod pallet {
         OptionQuery,
     >;
 
+    // Create another StorageValue for interval update
+
     #[pallet::error]
     pub enum Error<T> {
         // Issuer errors
         IssuerAlreadyExists,
-        IssuerNameTooLong,
         IssuerDomainTooLong,
         IssuerJWKSTooLong,
         IssuerOpenIdURLTooLong,
@@ -159,7 +161,6 @@ pub mod pallet {
         IssuerUpdateIntervalBelowMin, // To Do: Is this needed?
         IssuerUpdateIntervalNotMultipleOfBlock,
         IssuerOpenIdURLOrJWKSNotProvided,
-        IssuerUpdated,
         OnlyGovernanceCanUpdateIssuer,
         OnlyGovernanceCanDeleteIssuer,
         InvalidJsonFormatForJWKS,
@@ -213,6 +214,10 @@ pub mod pallet {
 
             IssuerMap::<T>::insert(&domain, issuer);
 
+            if let Some(jwks) = jwks {
+                JwksMap::<T>::insert(&domain, jwks);
+            }
+
             Self::deposit_event(Event::<T>::IssuerRegistered { who: who, domain });
 
             Ok(())
@@ -231,6 +236,11 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the issuer
 
+            // ToDo: Check if the issuer exists
+            if !IssuerMap::<T>::contains_key(&domain) {
+                return Err(Error::<T>::IssuerDoesNotExist.into());
+            }
+
             Self::validate_all(
                 &domain,
                 &open_id_url,
@@ -248,11 +258,10 @@ pub mod pallet {
                 status,
             };
 
-            // Update Issuer storage only if the issuer exists
-            if IssuerMap::<T>::contains_key(&domain) {
-                IssuerMap::<T>::insert(&domain, issuer);
-            } else {
-                return Err(Error::<T>::IssuerDoesNotExist.into());
+            IssuerMap::<T>::insert(&domain, issuer);
+
+            if let Some(jwks) = jwks {
+                JwksMap::<T>::insert(&domain, jwks);
             }
 
             Self::deposit_event(Event::<T>::IssuerUpdated { who, domain });
@@ -278,6 +287,11 @@ pub mod pallet {
 
             // Delete the issuer
             IssuerMap::<T>::remove(&domain);
+
+            // Delete the jwks from the JwksMap if it exists
+            if JwksMap::<T>::contains_key(&domain) {
+                JwksMap::<T>::remove(&domain);
+            }
 
             Self::deposit_event(Event::<T>::IssuerDeleted { who, domain });
 
@@ -419,12 +433,14 @@ pub mod pallet {
 
             // Check if the jwks is already proposed
             let jwks = jwks.clone();
-            if JksProposals::<T>::contains_key((domain.clone(), jwks.clone(), who.clone())) {
+            if JwksProposals::<T>::contains_key((domain.clone(), jwks.clone(), who.clone())) {
                 return Err(Error::<T>::AlreadyVotedForJWKS.into());
             }
 
             // Propose the jwks
-            JksProposals::<T>::insert((domain.clone(), jwks.clone(), who.clone()), ());
+            JwksProposals::<T>::insert((domain.clone(), jwks.clone(), who.clone()), ());
+
+            // ToDo: Pending to modify with the new storages tables
 
             Ok(())
         }
@@ -447,7 +463,7 @@ pub mod pallet {
 
             let most_voted_jwks = Self::get_jwks_with_higher_count(&domain);
 
-            // Insert the most voted jwks in the JksMap
+            // Insert the most voted jwks in the JwksMap
             JwksMap::<T>::insert(&domain, most_voted_jwks);
 
             Self::deposit_event(Event::<T>::IssuerJWKSUpdated { who, domain });
@@ -459,11 +475,11 @@ pub mod pallet {
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         fn on_finalize(_n: BlockNumberFor<T>) {
-            // Set the jwks in the JksMap
+            // Set the jwks in the JwksMap
             // Self::set_jwks();
 
             // Clear all JWKS proposals
-            // JksProposals::<T>::clear();
+            // JwksProposals::<T>::clear();
 
             info!("Cleaning all JWKS proposals");
         }
@@ -491,8 +507,8 @@ pub mod pallet {
         //                 continue; // Continue to the next issuer, JWKS is not provided and can not get fetched from internet
         //             }
         //         }
-        //         // Store the jwks in the proposal storage(JksProposals)
-        //         // JksProposals::<T>::insert((issuer.name, jwks_url, who), ());
+        //         // Store the jwks in the proposal storage(JwksProposals)
+        //         // JwksProposals::<T>::insert((issuer.name, jwks_url, who), ());
 
         //     }
         // }
@@ -528,11 +544,13 @@ impl<T: Config> Pallet<T> {
                 jwks.len() <= T::MaxLengthIssuerJWKS::get() as usize,
                 Error::<T>::IssuerJWKSTooLong
             );
+
+            // ToDo: Verify the jwks is a valid json file
         }
         Ok(())
     }
 
-    fn validate_issuer_open_id_url_or_jwks(
+    fn validate_issuer_open_id_url_or_jwks( // ToDo: Define if mutual exclution here is needed
         open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
         jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
     ) -> DispatchResult {
@@ -576,7 +594,7 @@ impl<T: Config> Pallet<T> {
     ) -> u32 {
         let prefix = (issuer_domain, issuer_jwks);
 
-        let count = JksProposals::<T>::iter_prefix(prefix).count();
+        let count = JwksProposals::<T>::iter_prefix(prefix).count();
 
         count as u32
     }
@@ -618,4 +636,8 @@ impl<T: Config> Pallet<T> {
             None
         }
     }
+
+    // Http functions comes here!
+
+    // ToDo: Create a minimal and deterministic jwks including the kid and the relevant fields. Optional! 
 }
