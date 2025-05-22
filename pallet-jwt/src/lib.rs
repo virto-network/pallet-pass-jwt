@@ -10,9 +10,12 @@ use sp_runtime::traits::AtLeast32BitUnsigned;
 pub mod pallet {
     use super::*;
     use frame::prelude::*;
+    use frame_support::Blake2_128Concat;
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
+
+    // Configs
 
     #[pallet::config]
     pub trait Config: frame_system::Config {
@@ -38,6 +41,9 @@ pub mod pallet {
 
         #[pallet::constant]
         type MaxUpdateInterval: Get<u32>;
+
+        #[pallet::constant]
+        type MaxProposersPerIssuer: Get<u32>;
     }
 
     // Structs
@@ -47,12 +53,12 @@ pub mod pallet {
         // Issuer OpenID URL, like "https://accounts.google.com/.well-known/openid-configuration", "https://account.apple.com/.well-known/openid-configuration", etc.
         pub open_id_url: Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
         // How many blocks to wait before the issuer can be updated
-        pub update_interval: BlockNumberFor<T>,
-        // Auto update enabled or not
-        pub auto_update: bool,
+        pub interval_update: Option<u32>, // None means no auto update.
         // Issuer is active or not for validating JWT
         pub status: bool,
     }
+
+    // Events
 
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -96,13 +102,13 @@ pub mod pallet {
             auto_update: bool,
         },
 
-        IssuerUpdateIntervalUpdated {
+        IssuerIntervalUpdateUpdated {
             /// The account who updated the issuer.
             who: T::AccountId,
             /// The issuer domain.
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             /// The new update interval.
-            update_interval: BlockNumberFor<T>,
+            interval_update: Option<u32>,
         },
 
         IssuerJWKSUpdated {
@@ -120,9 +126,11 @@ pub mod pallet {
         },
     }
 
+    // Storages
+
     #[pallet::storage]
     pub type IssuerMap<T: Config> =
-        StorageMap<_, Twox64Concat, BoundedVec<u8, T::MaxLengthIssuerDomain>, Issuer<T>>; // Domain of the issuer -> Issuer
+        StorageMap<_, Twox64Concat, BoundedVec<u8, T::MaxLengthIssuerDomain>, Issuer<T>>; // Domain of the issuer -> Issuer struct
 
     #[pallet::storage]
     pub type JwksMap<T: Config> = StorageMap<
@@ -132,20 +140,43 @@ pub mod pallet {
         BoundedVec<u8, T::MaxLengthIssuerJWKS>,   // JWKS
     >;
 
+    // ToDo: Check if this is needed. If not, remove it. It is intended to be used as a way to be sure that a proposers has not proposed for the same jwks more than once.
     #[pallet::storage]
-    pub type JwksProposals<T: Config> = CountedStorageNMap<
-        // ToDo: Replace this with two StorageMap or StorageDoubleMap
+    pub type AccountsProposedForIssuer<T: Config> = StorageMap<
         _,
-        (
-            NMapKey<Blake2_128Concat, BoundedVec<u8, T::MaxLengthIssuerDomain>>, // Issuer Domain
-            NMapKey<Blake2_128Concat, BoundedVec<u8, T::MaxLengthIssuerJWKS>>,   // JWKS
-            NMapKey<Blake2_128Concat, T::AccountId>,                             // AccountId
-        ),
-        (),
-        OptionQuery,
+        Blake2_128Concat,
+        BoundedVec<u8, T::MaxLengthIssuerDomain>,
+        BoundedVec<T::AccountId, T::MaxProposersPerIssuer>,
+    >; // Domain of the issuer => List of accounts that proposed the jwks
+
+    // Hash of the jwks => JWKS. JWKS can be reused! Saving a lot of space.
+    #[pallet::storage]
+    pub type JwksHash<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        H256, // ToDo: Is this correct?
+        BoundedVec<u8, T::MaxLengthIssuerJWKS>,
     >;
 
-    // Create another StorageValue for interval update
+    // Issuer => Hash of the jwks proposed => Counter
+    #[pallet::storage]
+    pub type CounterProposedJwksHash<T: Config> = StorageDoubleMap<
+        // Domain => Hash of the jwks => Counter
+        _,
+        Blake2_128Concat, // ToDo: Is this correct?
+        BoundedVec<u8, T::MaxLengthIssuerDomain>,
+        Blake2_128Concat, // ToDo: Is this correct?
+        H256,
+        u32,
+        ValueQuery,
+    >;
+
+    // StorageMap for the interval update counter of each issuer
+    #[pallet::storage]
+    pub type CounterIntervalUpdateIssuer<T: Config> =
+        StorageMap<_, Blake2_128Concat, BoundedVec<u8, T::MaxLengthIssuerDomain>, u32>;
+
+    // Errors
 
     #[pallet::error]
     pub enum Error<T> {
@@ -155,8 +186,6 @@ pub mod pallet {
         IssuerJWKSTooLong,
         IssuerOpenIdURLTooLong,
         IssuerDoesNotExist,
-        IssuerAutoUpdateAlreadyEnabled,
-        IssuerAutoUpdateAlreadyDisabled,
         IssuerUpdateIntervalAboveMax,
         IssuerUpdateIntervalBelowMin, // To Do: Is this needed?
         IssuerUpdateIntervalNotMultipleOfBlock,
@@ -165,9 +194,13 @@ pub mod pallet {
         OnlyGovernanceCanDeleteIssuer,
         InvalidJsonFormatForJWKS,
         InvalidJsonFormatForOpenIdURL,
-        AlreadyVotedForJWKS,
-        OnlyValidatorsCanVoteForJWKS,
+        AlreadyProposedForJWKS,
+        OnlyValidatorsCanProposeJWKS,
+        DomainNotRegistered,
+        MaxProposersPerIssuerExceeded,
     }
+
+    // Calls
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
@@ -177,139 +210,140 @@ pub mod pallet {
         // The issuer is registered in the storage map.
         // The event IssuerRegistered is emitted.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::default())]
+        #[pallet::weight(Weight::default())] // -> #[pallet::weight(<T as Config>::WeightInfo::register_issuer())] 
         pub fn register_issuer(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             open_id_url: Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
             jwks: Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
-            update_interval: BlockNumberFor<T>,
-            auto_update: bool,
+            interval_update: Option<u32>,
             status: bool,
         ) -> DispatchResult {
-            // ensure_root(origin)?;
             let who = ensure_signed(origin)?;
 
-            // Check if the issuer already exists
-            if IssuerMap::<T>::contains_key(&domain) {
-                return Err(Error::<T>::IssuerAlreadyExists.into());
-            }
+            // ── 1. mutate-or-fail in a single storage access ───────────────────────
+            IssuerMap::<T>::try_mutate_exists(&domain, |slot| -> DispatchResult {
+                // duplicate?
+                ensure!(slot.is_none(), Error::<T>::IssuerAlreadyExists);
 
-            Self::validate_all(
-                &domain,
-                &open_id_url,
-                &jwks,
-                &update_interval,
-                &auto_update,
-                &status,
-            )?;
+                Self::validate_issuer_open_id_url_or_jwks(&open_id_url, &jwks)?;
+                Self::validate_interval_update(&interval_update)?;
 
-            // Create the issuer
-            let issuer = Issuer {
-                open_id_url,
-                update_interval,
-                auto_update,
-                status,
-            };
+                // insert the freshly built Issuer
+                *slot = Some(Issuer {
+                    open_id_url: open_id_url.clone(), // we’ll need the originals later
+                    interval_update,
+                    status,
+                });
 
-            IssuerMap::<T>::insert(&domain, issuer);
+                Ok(())
+            })?; // <- propagate any error from the closure
 
+            // ── 2. secondary tables (JWKS, counter)  ───────────────────────────────
             if let Some(jwks) = jwks {
                 JwksMap::<T>::insert(&domain, jwks);
             }
 
-            Self::deposit_event(Event::<T>::IssuerRegistered { who: who, domain });
+            CounterIntervalUpdateIssuer::<T>::insert(&domain, interval_update.unwrap_or(0));
+
+            Self::deposit_event(Event::<T>::IssuerRegistered { who, domain });
 
             Ok(())
         }
 
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::default())]
+        #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::update_issuer())] // use real benchmarked weight
         pub fn update_issuer(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             open_id_url: Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
             jwks: Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
-            update_interval: BlockNumberFor<T>,
-            auto_update: bool,
+            interval_update: Option<u32>,
             status: bool,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the issuer
+            let who = ensure_signed(origin)?;
+            // TODO: check that `who` is authorised to update this issuer
 
-            // ToDo: Check if the issuer exists
-            if !IssuerMap::<T>::contains_key(&domain) {
-                return Err(Error::<T>::IssuerDoesNotExist.into());
+            //----------------------------------------------------------------------
+            // 1. update the Issuer entry in ONE storage access
+            //----------------------------------------------------------------------
+            IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
+                // a) bail out if the issuer does not exist
+                let issuer = maybe_issuer
+                    .as_mut()
+                    .ok_or(Error::<T>::IssuerDoesNotExist)?;
+
+                // b) run field-level validation
+                Self::validate_issuer_open_id_url_or_jwks(&open_id_url, &jwks)?;
+                Self::validate_interval_update(&interval_update)?;
+
+                // c) overwrite the fields (your semantics: “replace, even with None”)
+                issuer.open_id_url = open_id_url.clone();
+                issuer.interval_update = interval_update;
+                issuer.status = status;
+
+                Ok(())
+            })?;
+
+            //----------------------------------------------------------------------
+            // 2. synchronise JWKS table
+            //----------------------------------------------------------------------
+            match jwks {
+                Some(new_jwks) => JwksMap::<T>::insert(&domain, new_jwks),
+                None => JwksMap::<T>::remove(&domain),
             }
 
-            Self::validate_all(
-                &domain,
-                &open_id_url,
-                &jwks,
-                &update_interval,
-                &auto_update,
-                &status,
-            )?;
-
-            // Create the issuer
-            let issuer = Issuer {
-                open_id_url,
-                update_interval,
-                auto_update,
-                status,
-            };
-
-            IssuerMap::<T>::insert(&domain, issuer);
-
-            if let Some(jwks) = jwks {
-                JwksMap::<T>::insert(&domain, jwks);
+            //----------------------------------------------------------------------
+            // 3. synchronise counter if the caller supplied a new value
+            //----------------------------------------------------------------------
+            if let Some(iu) = interval_update {
+                CounterIntervalUpdateIssuer::<T>::insert(&domain, iu);
             }
 
+            //----------------------------------------------------------------------
+            // 4. emit the event
+            //----------------------------------------------------------------------
             Self::deposit_event(Event::<T>::IssuerUpdated { who, domain });
-
             Ok(())
         }
 
         #[pallet::call_index(2)]
-        #[pallet::weight(Weight::default())]
+        #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::delete_issuer())]
         pub fn delete_issuer(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to delete the issuer
+            let who = ensure_signed(origin)?;
+            // TODO: verify that `who` is authorised to delete this issuer
 
-            // Validate the issuer domain
-            Self::validate_issuer_domain(&domain)?;
+            // ── 1. remove from IssuerMap in one storage access ────────────────────
+            IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
+                ensure!(maybe_issuer.is_some(), Error::<T>::IssuerDoesNotExist);
+                *maybe_issuer = None; // delete the key
+                Ok(())
+            })?; // ← propagates the “does not exist” error
 
-            // Check if the issuer exists
-            if !IssuerMap::<T>::contains_key(&domain) {
-                return Err(Error::<T>::IssuerDoesNotExist.into());
-            }
+            // ── 2. clean up auxiliary tables (they may or may not be present) ─────
+            JwksMap::<T>::remove(&domain);
+            CounterIntervalUpdateIssuer::<T>::remove(&domain);
 
-            // Delete the issuer
-            IssuerMap::<T>::remove(&domain);
-
-            // Delete the jwks from the JwksMap if it exists
-            if JwksMap::<T>::contains_key(&domain) {
-                JwksMap::<T>::remove(&domain);
-            }
-
+            // ── 3. emit an event ──────────────────────────────────────────────────
             Self::deposit_event(Event::<T>::IssuerDeleted { who, domain });
 
             Ok(())
         }
 
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::default())]
+        #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::set_update_interval())]
         pub fn set_update_interval(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
-            update_interval: BlockNumberFor<T>,
+            interval_update: Option<u32>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to delete the issuer
 
             // Validate the issuer domain
-            Self::validate_issuer_domain(&domain)?;
-            Self::validate_update_interval(&update_interval)?;
+            Self::validate_interval_update(&interval_update)?;
 
             // Check if the issuer exists
             if !IssuerMap::<T>::contains_key(&domain) {
@@ -317,66 +351,43 @@ pub mod pallet {
             }
 
             // Update the update interval
-            IssuerMap::<T>::get(&domain).unwrap().update_interval = update_interval;
+            IssuerMap::<T>::get(&domain).unwrap().interval_update = interval_update;
 
-            Self::deposit_event(Event::<T>::IssuerUpdateIntervalUpdated {
+            Self::deposit_event(Event::<T>::IssuerIntervalUpdateUpdated {
                 who,
                 domain,
-                update_interval,
+                interval_update,
             });
 
             Ok(())
         }
 
         #[pallet::call_index(4)]
-        #[pallet::weight(Weight::default())]
-        pub fn set_auto_update(
-            origin: OriginFor<T>,
-            domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
-            auto_update: bool,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the auto update
-
-            // Validate the issuer domain
-            Self::validate_issuer_domain(&domain)?;
-
-            // Check if the issuer exists
-            if !IssuerMap::<T>::contains_key(&domain) {
-                return Err(Error::<T>::IssuerDoesNotExist.into());
-            }
-
-            // Update the auto update
-            IssuerMap::<T>::get(&domain).unwrap().auto_update = auto_update;
-
-            Self::deposit_event(Event::<T>::IssuerAutoUpdateUpdated {
-                who,
-                domain,
-                auto_update,
-            });
-
-            Ok(())
-        }
-
-        #[pallet::call_index(5)]
-        #[pallet::weight(Weight::default())]
+        #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::set_status())]          // benchmarked weight
         pub fn set_status(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             status: bool,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the status
+            let who = ensure_signed(origin)?;
+            // TODO: make sure `who` has permission to update this issuer
 
-            // Validate the issuer domain
-            Self::validate_issuer_domain(&domain)?;
+            IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
+                // fail if the domain is unknown
+                let issuer = maybe_issuer
+                    .as_mut()
+                    .ok_or(Error::<T>::IssuerDoesNotExist)?;
 
-            // Check if the issuer exists
-            if !IssuerMap::<T>::contains_key(&domain) {
-                return Err(Error::<T>::IssuerDoesNotExist.into());
-            }
+                // optional micro-optimisation: return early if no change
+                if issuer.status == status {
+                    return Ok(());
+                }
 
-            // Update the status
-            IssuerMap::<T>::get(&domain).unwrap().status = status;
+                issuer.status = status;
+                Ok(())
+            })?;
 
+            // ── 2. emit the event ────────────────────────────────────────────────
             Self::deposit_event(Event::<T>::IssuerStatusUpdated {
                 who,
                 domain,
@@ -386,87 +397,169 @@ pub mod pallet {
             Ok(())
         }
 
-        #[pallet::call_index(6)]
-        #[pallet::weight(Weight::default())]
+        #[pallet::call_index(5)]
+        #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::set_open_id_url())]
         pub fn set_open_id_url(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             open_id_url: BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the open id url
+            let who = ensure_signed(origin)?;
+            // TODO: verify `who` is authorised to change this issuer
 
-            // Validate the issuer domain
-            Self::validate_issuer_domain(&domain)?;
+            // ── 1. (optional) validate the new URL before touching storage ───────
+            Self::validate_issuer_open_id_url(&Some(open_id_url.clone()))?;
 
-            // Check if the issuer exists
-            if !IssuerMap::<T>::contains_key(&domain) {
-                return Err(Error::<T>::IssuerDoesNotExist.into());
-            }
+            // ── 2. mutate the issuer entry atomically ────────────────────────────
+            IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
+                // bail out if the issuer is unknown
+                let issuer = maybe_issuer
+                    .as_mut()
+                    .ok_or(Error::<T>::IssuerDoesNotExist)?;
 
-            // Update the open id url
-            IssuerMap::<T>::get(&domain).unwrap().open_id_url = Some(open_id_url);
+                // micro-optimisation: no change, no write, no event
+                if issuer.open_id_url.as_ref() == Some(&open_id_url) {
+                    return Ok(());
+                }
 
+                issuer.open_id_url = Some(open_id_url.clone());
+                Ok(())
+            })?; // any error (e.g. DoesNotExist) bubbles up
+
+            // ── 3. emit the event ────────────────────────────────────────────────
             Self::deposit_event(Event::<T>::IssuerOpenIdURLUpdated { who, domain });
 
             Ok(())
         }
 
-        #[pallet::call_index(7)]
-        #[pallet::weight(Weight::default())]
+        #[pallet::call_index(6)]
+        #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::propose_jwks())]   // replace with Weight::default() until you benchmark
         pub fn propose_jwks(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to propose the jwks Validators only!!!
+            //------------------------------------------------------------------
+            // 0. origin – only validators are allowed to call this
+            //------------------------------------------------------------------
+            let who = ensure_signed(origin)?;
 
-            // Validate the issuer domain
-            Self::validate_issuer_domain(&domain)?;
+            // ensure!(
+            //     Self::is_validator(&who), // implement this helper
+            //     Error::<T>::OnlyValidatorsCanProposeJWKS
+            // );
 
-            // Validate the jwks
-            Self::validate_issuer_jwks(&Some(jwks.clone()))?;
+            //------------------------------------------------------------------
+            // 1. the issuer must exist
+            //------------------------------------------------------------------
+            ensure!(
+                IssuerMap::<T>::contains_key(&domain),
+                Error::<T>::IssuerDoesNotExist
+            );
 
-            // Check if the issuer exists
-            if !IssuerMap::<T>::contains_key(&domain) {
-                return Err(Error::<T>::IssuerDoesNotExist.into());
-            }
+            //------------------------------------------------------------------
+            // 2. hash the JWKS document so we can deduplicate storage
+            //------------------------------------------------------------------
+            let jwks_hash = H256::from(blake2_256(jwks.as_slice()));
 
-            // Check if the jwks is already proposed
-            let jwks = jwks.clone();
-            if JwksProposals::<T>::contains_key((domain.clone(), jwks.clone(), who.clone())) {
-                return Err(Error::<T>::AlreadyVotedForJWKS.into());
-            }
+            //------------------------------------------------------------------
+            // 3. record that THIS validator has already proposed for THIS domain
+            //------------------------------------------------------------------
+            AccountsProposedForIssuer::<T>::try_mutate(&domain, |opt_vec| -> DispatchResult {
+                // lazily create an empty bounded‐vec when the first proposal arrives
+                let vec = opt_vec.get_or_insert_with(
+                    BoundedVec::<T::AccountId, T::MaxProposersPerIssuer>::default,
+                );
 
-            // Propose the jwks
-            JwksProposals::<T>::insert((domain.clone(), jwks.clone(), who.clone()), ());
+                // duplicate proposal?
+                ensure!(!vec.contains(&who), Error::<T>::AlreadyProposedForJWKS);
 
-            // ToDo: Pending to modify with the new storages tables
+                // push – fail if MaxProposersPerIssuer is reached
+                vec.try_push(who.clone())
+                    .map_err(|_| Error::<T>::MaxProposersPerIssuerExceeded)?;
+
+                Ok(())
+            })?;
+
+            //------------------------------------------------------------------
+            // 4. store the JWKS bytes if we haven’t seen this hash before
+            //------------------------------------------------------------------
+            JwksHash::<T>::try_mutate(jwks_hash, |slot| -> DispatchResult {
+                if slot.is_none() {
+                    *slot = Some(jwks.clone());
+                }
+                Ok(())
+            })?;
+
+            //------------------------------------------------------------------
+            // 5. bump the (domain, hash) counter atomically
+            //------------------------------------------------------------------
+            CounterProposedJwksHash::<T>::mutate(
+                &domain,   // first key
+                jwks_hash, // second key (by value or &jwks_hash)
+                |count| {
+                    *count = count.saturating_add(1);
+                },
+            );
+
+            //------------------------------------------------------------------
+            // 6. emit an event
+            //------------------------------------------------------------------
+            Self::deposit_event(Event::<T>::IssuerJWKSUpdated { who, domain });
 
             Ok(())
         }
 
-        #[pallet::call_index(8)]
-        #[pallet::weight(Weight::default())]
+        #[pallet::call_index(7)]
+        #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::set_jwks())]   // replace with Weight::default() until you benchmark
         pub fn set_jwks(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to update the jwks
+            //------------------------------------------------------------------
+            // 0. origin.  (replace with your own permission check or keep TODO)
+            //------------------------------------------------------------------
+            let who = ensure_signed(origin)?;
+            // TODO: ensure root / governance / issuer owner:
+            // ensure!(Self::can_modify_jwks(&who, &domain), Error::<T>::OnlyGovernanceCanUpdateIssuer);
 
-            // Validate the issuer domain
-            Self::validate_issuer_domain(&domain)?;
+            //------------------------------------------------------------------
+            // 1. the issuer must exist
+            //------------------------------------------------------------------
+            ensure!(
+                IssuerMap::<T>::contains_key(&domain),
+                Error::<T>::IssuerDoesNotExist
+            );
 
-            // Check if the issuer exists
-            if !IssuerMap::<T>::contains_key(&domain) {
-                return Err(Error::<T>::IssuerDoesNotExist.into());
+            //------------------------------------------------------------------
+            // 2. pick the JWKS with the highest vote count
+            //------------------------------------------------------------------
+            let winning_jwks: Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>> =
+                Some(Self::get_jwks_with_higher_count(&domain));
+
+            // No JWKS proposals yet?
+            let winning_jwks = winning_jwks.ok_or(Error::<T>::AlreadyProposedForJWKS)?; // or introduce a new error
+
+            //------------------------------------------------------------------
+            // 3. write to JwksMap only if it changed
+            //------------------------------------------------------------------
+            let mut changed: bool = false;
+            JwksMap::<T>::try_mutate(&domain, |slot| -> DispatchResult {
+                if slot.as_ref() == Some(&winning_jwks) {
+                    // No change, skip write & later event
+                    return Ok(());
+                }
+                *slot = Some(winning_jwks.clone());
+                changed = true;
+                Ok(())
+            })?;
+
+            //------------------------------------------------------------------
+            // 4. emit event only when we actually updated the JWKS
+            //------------------------------------------------------------------
+            if changed {
+                Self::deposit_event(Event::<T>::IssuerJWKSUpdated { who, domain });
             }
-
-            let most_voted_jwks = Self::get_jwks_with_higher_count(&domain);
-
-            // Insert the most voted jwks in the JwksMap
-            JwksMap::<T>::insert(&domain, most_voted_jwks);
-
-            Self::deposit_event(Event::<T>::IssuerJWKSUpdated { who, domain });
 
             Ok(())
         }
@@ -516,41 +609,22 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
-    fn validate_issuer_domain(domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>) -> DispatchResult {
-        ensure!(
-            domain.len() <= T::MaxLengthIssuerDomain::get() as usize,
-            Error::<T>::IssuerDomainTooLong
-        );
-        Ok(())
-    }
-
     fn validate_issuer_open_id_url(
-        open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
+        _open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
     ) -> DispatchResult {
-        if let Some(open_id_url) = open_id_url {
-            ensure!(
-                open_id_url.len() <= T::MaxLengthIssuerOpenIdURL::get() as usize,
-                Error::<T>::IssuerOpenIdURLTooLong
-            );
-        }
+        // Logic here
         Ok(())
     }
 
     fn validate_issuer_jwks(
-        jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
+        _jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
     ) -> DispatchResult {
-        if let Some(jwks) = jwks {
-            ensure!(
-                jwks.len() <= T::MaxLengthIssuerJWKS::get() as usize,
-                Error::<T>::IssuerJWKSTooLong
-            );
-
-            // ToDo: Verify the jwks is a valid json file
-        }
+        // Logic here
         Ok(())
     }
 
-    fn validate_issuer_open_id_url_or_jwks( // ToDo: Define if mutual exclution here is needed
+    fn validate_issuer_open_id_url_or_jwks(
+        // ToDo: Define if mutual exclution here is needed
         open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
         jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
     ) -> DispatchResult {
@@ -559,54 +633,56 @@ impl<T: Config> Pallet<T> {
         Ok(())
     }
 
-    fn validate_update_interval(update_interval: &BlockNumberFor<T>) -> DispatchResult {
+    fn validate_interval_update(interval_update: &Option<u32>) -> DispatchResult {
         // Ensure the update interval is not above the max
         ensure!(
-            *update_interval <= T::MaxUpdateInterval::get().into(),
+            *interval_update <= T::MaxUpdateInterval::get().into(),
             Error::<T>::IssuerUpdateIntervalAboveMax
         );
 
         // Ensure the update interval is not below the min
         ensure!(
-            *update_interval >= T::MinUpdateInterval::get().into(),
+            *interval_update >= T::MinUpdateInterval::get().into(),
             Error::<T>::IssuerUpdateIntervalBelowMin
         );
         Ok(())
     }
 
-    fn validate_all(
-        domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
-        open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
-        jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
-        update_interval: &BlockNumberFor<T>,
-        _auto_update: &bool,
-        _status: &bool,
-    ) -> DispatchResult {
-        Self::validate_issuer_domain(domain)?;
-        Self::validate_issuer_open_id_url_or_jwks(open_id_url, jwks)?;
-        Self::validate_update_interval(update_interval)?;
-        Ok(())
-    }
-
     pub fn count_accounts_for_issuer_jwks(
-        issuer_domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
-        issuer_jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
+        _issuer_domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
+        _issuer_jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
     ) -> u32 {
-        let prefix = (issuer_domain, issuer_jwks);
-
-        let count = JwksProposals::<T>::iter_prefix(prefix).count();
-
-        count as u32
+        0
     }
 
+    /// Return the JWKS document that has the highest proposal count for
+    /// the given issuer domain.  
+    /// If the issuer has no JWKS proposals yet, this returns an *empty*
+    /// `BoundedVec`, which the caller can interpret as “no winner”.
     pub fn get_jwks_with_higher_count(
         issuer_domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
     ) -> BoundedVec<u8, T::MaxLengthIssuerJWKS> {
-        info!("get_jwks_with_higher_count for {:?}", issuer_domain);
-        // Create empty jwks
-        let jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS> = BoundedVec::new();
+        use frame::hashing::H256;
 
-        jwks
+        // 1. Walk over all (hash, counter) pairs under `issuer_domain`
+        let mut best: Option<(H256, u32)> = None;
+        for (hash, counter) in CounterProposedJwksHash::<T>::iter_prefix(issuer_domain) {
+            match best {
+                // keep the hash with the strictly highest counter
+                Some((_, best_cnt)) if counter <= best_cnt => {}
+                _ => best = Some((hash, counter)),
+            }
+        }
+
+        // 2. Resolve the winning hash back to raw JWKS bytes
+        if let Some((winning_hash, _)) = best {
+            if let Some(jwks) = JwksHash::<T>::get(winning_hash) {
+                return jwks; // ← success path
+            }
+        }
+
+        // 3. Otherwise return an empty bounded vector
+        BoundedVec::<u8, T::MaxLengthIssuerJWKS>::default()
     }
 
     // Here comes the function to get the jwks url from Issuer
@@ -639,5 +715,5 @@ impl<T: Config> Pallet<T> {
 
     // Http functions comes here!
 
-    // ToDo: Create a minimal and deterministic jwks including the kid and the relevant fields. Optional! 
+    // ToDo: Create a minimal and deterministic jwks including the kid and the relevant fields. Optional!
 }
