@@ -25,9 +25,6 @@ pub mod pallet {
         type BlockNumber: From<u32> + Into<u32> + AtLeast32BitUnsigned + Copy + MaxEncodedLen;
 
         #[pallet::constant]
-        type MaxLengthIssuerName: Get<u32>;
-
-        #[pallet::constant]
         type MaxLengthIssuerDomain: Get<u32>;
 
         #[pallet::constant]
@@ -55,7 +52,7 @@ pub mod pallet {
         // How many blocks to wait before the issuer can be updated
         pub interval_update: Option<u32>, // None means no auto update.
         // Issuer is active or not for validating JWT
-        pub status: bool,
+        pub is_enabled: bool,
     }
 
     // Events
@@ -84,13 +81,13 @@ pub mod pallet {
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
         },
 
-        IssuerStatusUpdated {
+        IssuerEnabledUpdated {
             /// The account who updated the issuer.
             who: T::AccountId,
             /// The issuer domain.
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             /// The new status.
-            status: bool,
+            is_enabled: bool,
         },
 
         IssuerAutoUpdateUpdated {
@@ -174,7 +171,7 @@ pub mod pallet {
     // StorageMap for the interval update counter of each issuer
     #[pallet::storage]
     pub type CounterIntervalUpdateIssuer<T: Config> =
-        StorageMap<_, Blake2_128Concat, BoundedVec<u8, T::MaxLengthIssuerDomain>, u32>;
+        StorageMap<_, Blake2_128Concat, BoundedVec<u8, T::MaxLengthIssuerDomain>, u32, ValueQuery>;
 
     // Errors
 
@@ -210,30 +207,31 @@ pub mod pallet {
         // The issuer is registered in the storage map.
         // The event IssuerRegistered is emitted.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::default())] // -> #[pallet::weight(<T as Config>::WeightInfo::register_issuer())] 
+        #[pallet::weight(Weight::default())] // -> #[pallet::weight(<T as Config>::WeightInfo::register_issuer())]
         pub fn register_issuer(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             open_id_url: Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
             jwks: Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
-            interval_update: Option<u32>,
-            status: bool,
+            mut interval_update: Option<u32>,
+            // is_enabled: bool,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
+            let who = ensure_signed(origin)?; // ToDo: check that `who` is authorized to update this issuer
 
             // ── 1. mutate-or-fail in a single storage access ───────────────────────
             IssuerMap::<T>::try_mutate_exists(&domain, |slot| -> DispatchResult {
                 // duplicate?
                 ensure!(slot.is_none(), Error::<T>::IssuerAlreadyExists);
 
-                Self::validate_issuer_open_id_url_or_jwks(&open_id_url, &jwks)?;
-                Self::validate_interval_update(&interval_update)?;
+                // Self::validate_open_id_or_jwks_json(&open_id_url, &jwks)?; // ToDo: Johan change this
+
+                Self::validate_interval_update(&mut interval_update);
 
                 // insert the freshly built Issuer
                 *slot = Some(Issuer {
                     open_id_url: open_id_url.clone(), // we’ll need the originals later
                     interval_update,
-                    status,
+                    is_enabled: true, // is_enabled by default is true
                 });
 
                 Ok(())
@@ -243,8 +241,6 @@ pub mod pallet {
             if let Some(jwks) = jwks {
                 JwksMap::<T>::insert(&domain, jwks);
             }
-
-            CounterIntervalUpdateIssuer::<T>::insert(&domain, interval_update.unwrap_or(0));
 
             Self::deposit_event(Event::<T>::IssuerRegistered { who, domain });
 
@@ -258,11 +254,11 @@ pub mod pallet {
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             open_id_url: Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
             jwks: Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
-            interval_update: Option<u32>,
-            status: bool,
+            mut interval_update: Option<u32>,
+            is_enabled: bool,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            // TODO: check that `who` is authorised to update this issuer
+            // TODO: check that `who` is authorized to update this issuer
 
             //----------------------------------------------------------------------
             // 1. update the Issuer entry in ONE storage access
@@ -274,13 +270,13 @@ pub mod pallet {
                     .ok_or(Error::<T>::IssuerDoesNotExist)?;
 
                 // b) run field-level validation
-                Self::validate_issuer_open_id_url_or_jwks(&open_id_url, &jwks)?;
-                Self::validate_interval_update(&interval_update)?;
+                // Self::validate_open_id_or_jwks_json(&open_id_url, &jwks)?; // Johan Modify this
+                Self::validate_interval_update(&mut interval_update);
 
                 // c) overwrite the fields (your semantics: “replace, even with None”)
                 issuer.open_id_url = open_id_url.clone();
                 issuer.interval_update = interval_update;
-                issuer.status = status;
+                issuer.is_enabled = is_enabled;
 
                 Ok(())
             })?;
@@ -294,14 +290,7 @@ pub mod pallet {
             }
 
             //----------------------------------------------------------------------
-            // 3. synchronise counter if the caller supplied a new value
-            //----------------------------------------------------------------------
-            if let Some(iu) = interval_update {
-                CounterIntervalUpdateIssuer::<T>::insert(&domain, iu);
-            }
-
-            //----------------------------------------------------------------------
-            // 4. emit the event
+            // 3. emit the event
             //----------------------------------------------------------------------
             Self::deposit_event(Event::<T>::IssuerUpdated { who, domain });
             Ok(())
@@ -338,12 +327,9 @@ pub mod pallet {
         pub fn set_update_interval(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
-            interval_update: Option<u32>,
+            mut interval_update: Option<u32>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to delete the issuer
-
-            // Validate the issuer domain
-            Self::validate_interval_update(&interval_update)?;
 
             // Check if the issuer exists
             if !IssuerMap::<T>::contains_key(&domain) {
@@ -352,6 +338,21 @@ pub mod pallet {
 
             // Update the update interval
             IssuerMap::<T>::get(&domain).unwrap().interval_update = interval_update;
+
+            IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
+                // a) bail out if the issuer does not exist
+                let issuer = maybe_issuer
+                    .as_mut()
+                    .ok_or(Error::<T>::IssuerDoesNotExist)?;
+
+                // b) run field-level validation
+                // Self::validate_open_id_or_jwks_json(&open_id_url, &jwks)?; // Johan Modify this
+                Self::validate_interval_update(&mut interval_update);
+
+                // c) overwrite the interval update
+                issuer.interval_update = interval_update;
+                Ok(())
+            })?;
 
             Self::deposit_event(Event::<T>::IssuerIntervalUpdateUpdated {
                 who,
@@ -363,11 +364,11 @@ pub mod pallet {
         }
 
         #[pallet::call_index(4)]
-        #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::set_status())]          // benchmarked weight
-        pub fn set_status(
+        #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::set_enabled())]          // benchmarked weight
+        pub fn set_enabled(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
-            status: bool,
+            is_enabled: bool,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             // TODO: make sure `who` has permission to update this issuer
@@ -379,19 +380,19 @@ pub mod pallet {
                     .ok_or(Error::<T>::IssuerDoesNotExist)?;
 
                 // optional micro-optimisation: return early if no change
-                if issuer.status == status {
+                if issuer.is_enabled == is_enabled {
                     return Ok(());
                 }
 
-                issuer.status = status;
+                issuer.is_enabled = is_enabled;
                 Ok(())
             })?;
 
             // ── 2. emit the event ────────────────────────────────────────────────
-            Self::deposit_event(Event::<T>::IssuerStatusUpdated {
+            Self::deposit_event(Event::<T>::IssuerEnabledUpdated {
                 who,
                 domain,
-                status,
+                is_enabled,
             });
 
             Ok(())
@@ -408,7 +409,7 @@ pub mod pallet {
             // TODO: verify `who` is authorised to change this issuer
 
             // ── 1. (optional) validate the new URL before touching storage ───────
-            Self::validate_issuer_open_id_url(&Some(open_id_url.clone()))?;
+            Self::validate_open_id_json(&Some(open_id_url.clone()))?;
 
             // ── 2. mutate the issuer entry atomically ────────────────────────────
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
@@ -609,43 +610,39 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
-    fn validate_issuer_open_id_url(
+    fn validate_open_id_json(
         _open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
     ) -> DispatchResult {
         // Logic here
         Ok(())
     }
 
-    fn validate_issuer_jwks(
+    fn _validate_jwks_json(
         _jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
     ) -> DispatchResult {
         // Logic here
         Ok(())
     }
 
-    fn validate_issuer_open_id_url_or_jwks(
+    fn _validate_open_id_or_jwks_json(
         // ToDo: Define if mutual exclution here is needed
         open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
         jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
     ) -> DispatchResult {
-        Self::validate_issuer_open_id_url(&open_id_url)?;
-        Self::validate_issuer_jwks(&jwks)?;
+        Self::validate_open_id_json(&open_id_url)?;
+        Self::_validate_jwks_json(&jwks)?;
         Ok(())
     }
 
-    fn validate_interval_update(interval_update: &Option<u32>) -> DispatchResult {
-        // Ensure the update interval is not above the max
-        ensure!(
-            *interval_update <= T::MaxUpdateInterval::get().into(),
-            Error::<T>::IssuerUpdateIntervalAboveMax
-        );
+    fn validate_interval_update(interval_update: &mut Option<u32>) {
+        let lower = T::MinUpdateInterval::get();
+        let upper = T::MaxUpdateInterval::get();
 
-        // Ensure the update interval is not below the min
-        ensure!(
-            *interval_update >= T::MinUpdateInterval::get().into(),
-            Error::<T>::IssuerUpdateIntervalBelowMin
-        );
-        Ok(())
+        if let Some(v) = interval_update {
+            // First raise the value to the lower bound,
+            // then cut it down to the upper bound.
+            *v = (*v).max(lower).min(upper);
+        }
     }
 
     pub fn count_accounts_for_issuer_jwks(
@@ -712,8 +709,4 @@ impl<T: Config> Pallet<T> {
             None
         }
     }
-
-    // Http functions comes here!
-
-    // ToDo: Create a minimal and deterministic jwks including the kid and the relevant fields. Optional!
 }
