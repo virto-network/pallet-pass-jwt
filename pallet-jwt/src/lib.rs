@@ -22,6 +22,8 @@ pub mod pallet {
         // Defines the event type for the pallet.
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
+        type AuthorityOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+
         type BlockNumber: From<u32> + Into<u32> + AtLeast32BitUnsigned + Copy + MaxEncodedLen;
 
         #[pallet::constant]
@@ -41,6 +43,9 @@ pub mod pallet {
 
         #[pallet::constant]
         type MaxProposersPerIssuer: Get<u32>;
+
+        /// The caller origin, overarching type of all pallets origins.
+        type JwtOrigin: From<frame_system::Origin<Self>>;
     }
 
     // Structs
@@ -137,7 +142,6 @@ pub mod pallet {
         BoundedVec<u8, T::MaxLengthIssuerJWKS>,   // JWKS
     >;
 
-    // ToDo: Check if this is needed. If not, remove it. It is intended to be used as a way to be sure that a proposers has not proposed for the same jwks more than once.
     #[pallet::storage]
     pub type AccountsProposedForIssuer<T: Config> = StorageMap<
         _,
@@ -148,21 +152,16 @@ pub mod pallet {
 
     // Hash of the jwks => JWKS. JWKS can be reused! Saving a lot of space.
     #[pallet::storage]
-    pub type JwksHash<T: Config> = StorageMap<
-        _,
-        Blake2_128Concat,
-        H256, // ToDo: Is this correct?
-        BoundedVec<u8, T::MaxLengthIssuerJWKS>,
-    >;
+    pub type JwksHash<T: Config> =
+        StorageMap<_, Blake2_128Concat, H256, BoundedVec<u8, T::MaxLengthIssuerJWKS>>;
 
-    // Issuer => Hash of the jwks proposed => Counter
+    // IssuerDomain => Hash of the jwks proposed => Counter
     #[pallet::storage]
     pub type CounterProposedJwksHash<T: Config> = StorageDoubleMap<
-        // Domain => Hash of the jwks => Counter
         _,
-        Blake2_128Concat, // ToDo: Is this correct?
+        Blake2_128Concat,
         BoundedVec<u8, T::MaxLengthIssuerDomain>,
-        Blake2_128Concat, // ToDo: Is this correct?
+        Blake2_128Concat,
         H256,
         u32,
         ValueQuery,
@@ -184,13 +183,12 @@ pub mod pallet {
         IssuerOpenIdURLTooLong,
         IssuerDoesNotExist,
         IssuerUpdateIntervalAboveMax,
-        IssuerUpdateIntervalBelowMin, // To Do: Is this needed?
         IssuerUpdateIntervalNotMultipleOfBlock,
         IssuerOpenIdURLOrJWKSNotProvided,
         OnlyGovernanceCanUpdateIssuer,
         OnlyGovernanceCanDeleteIssuer,
-        InvalidJsonFormatForJWKS,
-        InvalidJsonFormatForOpenIdURL,
+        InvalidJson,
+        JsonTooLong,
         AlreadyProposedForJWKS,
         OnlyValidatorsCanProposeJWKS,
         DomainNotRegistered,
@@ -222,8 +220,6 @@ pub mod pallet {
             IssuerMap::<T>::try_mutate_exists(&domain, |slot| -> DispatchResult {
                 // duplicate?
                 ensure!(slot.is_none(), Error::<T>::IssuerAlreadyExists);
-
-                // Self::validate_open_id_or_jwks_json(&open_id_url, &jwks)?; // ToDo: Johan change this
 
                 Self::validate_interval_update(&mut interval_update);
 
@@ -270,7 +266,6 @@ pub mod pallet {
                     .ok_or(Error::<T>::IssuerDoesNotExist)?;
 
                 // b) run field-level validation
-                // Self::validate_open_id_or_jwks_json(&open_id_url, &jwks)?; // Johan Modify this
                 Self::validate_interval_update(&mut interval_update);
 
                 // c) overwrite the fields (your semantics: “replace, even with None”)
@@ -346,7 +341,6 @@ pub mod pallet {
                     .ok_or(Error::<T>::IssuerDoesNotExist)?;
 
                 // b) run field-level validation
-                // Self::validate_open_id_or_jwks_json(&open_id_url, &jwks)?; // Johan Modify this
                 Self::validate_interval_update(&mut interval_update);
 
                 // c) overwrite the interval update
@@ -407,9 +401,6 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             // TODO: verify `who` is authorised to change this issuer
-
-            // ── 1. (optional) validate the new URL before touching storage ───────
-            Self::validate_open_id_json(&Some(open_id_url.clone()))?;
 
             // ── 2. mutate the issuer entry atomically ────────────────────────────
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
@@ -610,31 +601,55 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
-    fn validate_open_id_json(
-        _open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
-    ) -> DispatchResult {
-        // Logic here
+    pub fn validate_json<Len>(json: &BoundedVec<u8, Len>) -> DispatchResult
+    where
+        Len: Get<u32>,
+    {
+        // If parsing fails, convert the pallet error into `DispatchError` and bubble it up.
+        serde_json::from_slice::<serde_json::Value>(json).map_err(|_| Error::<T>::InvalidJson)?;
+
+        // Success path: just return `Ok(())`.
         Ok(())
     }
 
-    fn _validate_jwks_json(
-        _jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
-    ) -> DispatchResult {
-        // Logic here
+    /// Sort the top-level keys of a JSON object that lives in a `BoundedVec`.
+    ///
+    /// * For non-objects it returns `Error::<T>::InvalidJson`.
+    /// * If the re-encoded JSON would exceed the bound it returns
+    ///   `Error::<T>::JsonTooLong` (you will have to add that variant).
+    ///
+    /// It compiles on `no_std` Substrate crates because it only relies on
+    /// `sp_std::collections::btree_map::BTreeMap` for the ordering.
+    pub fn sort_json<Len>(json: &mut BoundedVec<u8, Len>) -> DispatchResult
+    where
+        Len: Get<u32>,
+    {
+        // --- 1. parse -----------------------------------------------------------
+        // `serde_json::from_slice` gives us an owned `serde_json::Value`.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(json).map_err(|_| Error::<T>::InvalidJson)?;
+
+        // --- 2. replace the internal `Map` with an ordered one -----------------
+        // Only objects can be sorted; any other variant is an error.
+        let map = value.as_object_mut().ok_or(Error::<T>::InvalidJson)?;
+
+        // `BTreeMap` keeps keys in lexicographic order,
+        // so we can just *move* the data into it and back.
+        use sp_std::collections::btree_map::BTreeMap;
+
+        let ordered: BTreeMap<_, _> = core::mem::take(map).into_iter().collect();
+        *map = ordered.into_iter().collect(); // back into the original `Map`
+
+        // --- 3. serialise back to bytes ----------------------------------------
+        let bytes = serde_json::to_vec(&value).map_err(|_| Error::<T>::InvalidJson)?;
+
+        // --- 4. enforce the length bound ---------------------------------------
+        *json = BoundedVec::<u8, Len>::try_from(bytes).map_err(|_| Error::<T>::JsonTooLong)?;
+
         Ok(())
     }
 
-    fn _validate_open_id_or_jwks_json(
-        // ToDo: Define if mutual exclution here is needed
-        open_id_url: &Option<BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>>,
-        jwks: &Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>>,
-    ) -> DispatchResult {
-        Self::validate_open_id_json(&open_id_url)?;
-        Self::_validate_jwks_json(&jwks)?;
-        Ok(())
-    }
-
-    fn validate_interval_update(interval_update: &mut Option<u32>) {
+    pub fn validate_interval_update(interval_update: &mut Option<u32>) {
         let lower = T::MinUpdateInterval::get();
         let upper = T::MaxUpdateInterval::get();
 
@@ -645,11 +660,10 @@ impl<T: Config> Pallet<T> {
         }
     }
 
-    pub fn count_accounts_for_issuer_jwks(
-        _issuer_domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
-        _issuer_jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
-    ) -> u32 {
-        0
+    /// Returns a vector of all registered issuer domains. -> ["Google", "Apple", "Facebook"]
+    pub fn get_issuers_vec() -> Vec<BoundedVec<u8, T::MaxLengthIssuerDomain>> {
+        // Iterate over all issuers in the storage and collect their domains
+        IssuerMap::<T>::iter_keys().collect()
     }
 
     /// Return the JWKS document that has the highest proposal count for
@@ -667,7 +681,7 @@ impl<T: Config> Pallet<T> {
             match best {
                 // keep the hash with the strictly highest counter
                 Some((_, best_cnt)) if counter <= best_cnt => {}
-                _ => best = Some((hash, counter)),
+                _ => best = Some((hash, counter)), // If the counter is higher, update the best
             }
         }
 

@@ -20,6 +20,7 @@ rsa = { version = "0.9.8" }
 base64 = { version = "0.22" }
 rand = { version = "0.9.1" }
 log = { version = "0.4.22" }
+serde_json = { version = "1.0.130" }
 
 # FRAME
 codec = { package = "parity-scale-codec", version = "3.7.4", default-features = false, features = [
