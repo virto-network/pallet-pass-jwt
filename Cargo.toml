@@ -48,4 +48,3 @@ pallet-pass = { git = "https://github.com/virto-network/frame-contrib", package 
 
 # Local Crates
 validator = { path = "validator" }
-pallet-jwt = { path = "pallet-jwt" }

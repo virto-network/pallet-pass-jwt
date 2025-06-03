@@ -6,6 +6,15 @@ use log::info;
 pub use pallet::*;
 use sp_runtime::traits::AtLeast32BitUnsigned;
 
+#[cfg(test)]
+mod mock;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+
 #[frame::pallet]
 pub mod pallet {
     use super::*;
