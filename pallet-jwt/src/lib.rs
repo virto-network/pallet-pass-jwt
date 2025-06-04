@@ -18,7 +18,7 @@ mod benchmarking;
 #[frame::pallet]
 pub mod pallet {
     use super::*;
-    use frame::prelude::*;
+    use frame::{prelude::*, traits::ValidatorSet};
     use frame_support::Blake2_128Concat;
 
     #[pallet::pallet]
@@ -31,9 +31,11 @@ pub mod pallet {
         // Defines the event type for the pallet.
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
-        type AuthorityOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+        type RegisterOrigin: EnsureOrigin<Self::RuntimeOrigin, Success = Self::AccountId>;
 
         type BlockNumber: From<u32> + Into<u32> + AtLeast32BitUnsigned + Copy + MaxEncodedLen;
+
+        type Validators: ValidatorSet<Self::AccountId, ValidatorId = Self::AccountId>;
 
         #[pallet::constant]
         type MaxLengthIssuerDomain: Get<u32>;
@@ -223,7 +225,7 @@ pub mod pallet {
             mut interval_update: Option<u32>,
             // is_enabled: bool,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?; // ToDo: check that `who` is authorized to update this issuer
+            let who = T::RegisterOrigin::ensure_origin(origin)?;
 
             // ── 1. mutate-or-fail in a single storage access ───────────────────────
             IssuerMap::<T>::try_mutate_exists(&domain, |slot| -> DispatchResult {
@@ -243,7 +245,9 @@ pub mod pallet {
             })?; // <- propagate any error from the closure
 
             // ── 2. secondary tables (JWKS, counter)  ───────────────────────────────
-            if let Some(jwks) = jwks {
+            if let Some(mut jwks) = jwks {
+                // Check if the jwks is valid
+                Self::validate_json(&mut jwks)?;
                 JwksMap::<T>::insert(&domain, jwks);
             }
 
@@ -262,8 +266,7 @@ pub mod pallet {
             mut interval_update: Option<u32>,
             is_enabled: bool,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            // TODO: check that `who` is authorized to update this issuer
+            let who = T::RegisterOrigin::ensure_origin(origin)?;
 
             //----------------------------------------------------------------------
             // 1. update the Issuer entry in ONE storage access
@@ -306,8 +309,7 @@ pub mod pallet {
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            // TODO: verify that `who` is authorised to delete this issuer
+            let who = T::RegisterOrigin::ensure_origin(origin)?;
 
             // ── 1. remove from IssuerMap in one storage access ────────────────────
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
@@ -333,7 +335,7 @@ pub mod pallet {
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             mut interval_update: Option<u32>,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?; // ToDo: Check if the who has rights to delete the issuer
+            let who = T::RegisterOrigin::ensure_origin(origin)?;
 
             // Check if the issuer exists
             if !IssuerMap::<T>::contains_key(&domain) {
@@ -373,8 +375,7 @@ pub mod pallet {
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             is_enabled: bool,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            // TODO: make sure `who` has permission to update this issuer
+            let who = T::RegisterOrigin::ensure_origin(origin)?;
 
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
                 // fail if the domain is unknown
@@ -408,8 +409,7 @@ pub mod pallet {
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             open_id_url: BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>,
         ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            // TODO: verify `who` is authorised to change this issuer
+            let who = T::RegisterOrigin::ensure_origin(origin)?;
 
             // ── 2. mutate the issuer entry atomically ────────────────────────────
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
@@ -444,11 +444,10 @@ pub mod pallet {
             // 0. origin – only validators are allowed to call this
             //------------------------------------------------------------------
             let who = ensure_signed(origin)?;
-
-            // ensure!(
-            //     Self::is_validator(&who), // implement this helper
-            //     Error::<T>::OnlyValidatorsCanProposeJWKS
-            // );
+            ensure!(
+                T::Validators::validators().contains(&who),
+                Error::<T>::OnlyValidatorsCanProposeJWKS
+            );
 
             //------------------------------------------------------------------
             // 1. the issuer must exist
@@ -518,11 +517,13 @@ pub mod pallet {
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
         ) -> DispatchResult {
             //------------------------------------------------------------------
-            // 0. origin.  (replace with your own permission check or keep TODO)
+            // 0. origin.
             //------------------------------------------------------------------
             let who = ensure_signed(origin)?;
-            // TODO: ensure root / governance / issuer owner:
-            // ensure!(Self::can_modify_jwks(&who, &domain), Error::<T>::OnlyGovernanceCanUpdateIssuer);
+            ensure!(
+                T::Validators::validators().contains(&who),
+                Error::<T>::OnlyValidatorsCanProposeJWKS
+            );
 
             //------------------------------------------------------------------
             // 1. the issuer must exist
@@ -578,11 +579,14 @@ pub mod pallet {
             info!("Cleaning all JWKS proposals");
         }
 
-        // // Here comes the offchain worker for getting the jwks from internet
         // fn on_initialize(n: BlockNumberFor<T>) {
         //     info!("Initializing the offchain worker for getting the jwks from internet");
         //     // Iterate on all the registered issuers
         //     for issuer in IssuerMap::<T>::iter() {
+        //         if !issuer.1.is_enabled || issuer.1.interval_update.is_none() || issuer.1.interval_update.unwrap() == 0 {
+        //             continue;
+        //         }
+
         //         let jskw_url;
         //         // Get the open id url
         //         let open_id_url = Self::get_open_id_url(&issuer.name);
@@ -610,50 +614,24 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
-    pub fn validate_json<Len>(json: &BoundedVec<u8, Len>) -> DispatchResult
+    pub fn validate_json<Len>(json: &mut BoundedVec<u8, Len>) -> DispatchResult
     where
         Len: Get<u32>,
     {
-        // If parsing fails, convert the pallet error into `DispatchError` and bubble it up.
-        serde_json::from_slice::<serde_json::Value>(json).map_err(|_| Error::<T>::InvalidJson)?;
+        // Parse JSON (keys will be sorted automatically)
+        let parsed = serde_json::from_slice::<serde_json::Value>(json.as_slice())
+            .map_err(|_| Error::<T>::InvalidJson)?;
 
-        // Success path: just return `Ok(())`.
-        Ok(())
-    }
+        // Serialize back into canonical form (keys ordered by BTreeMap)
+        let serialized = serde_json::to_string(&parsed).map_err(|_| Error::<T>::InvalidJson)?;
 
-    /// Sort the top-level keys of a JSON object that lives in a `BoundedVec`.
-    ///
-    /// * For non-objects it returns `Error::<T>::InvalidJson`.
-    /// * If the re-encoded JSON would exceed the bound it returns
-    ///   `Error::<T>::JsonTooLong` (you will have to add that variant).
-    ///
-    /// It compiles on `no_std` Substrate crates because it only relies on
-    /// `sp_std::collections::btree_map::BTreeMap` for the ordering.
-    pub fn sort_json<Len>(json: &mut BoundedVec<u8, Len>) -> DispatchResult
-    where
-        Len: Get<u32>,
-    {
-        // --- 1. parse -----------------------------------------------------------
-        // `serde_json::from_slice` gives us an owned `serde_json::Value`.
-        let mut value: serde_json::Value =
-            serde_json::from_slice(json).map_err(|_| Error::<T>::InvalidJson)?;
+        let bytes = serialized.as_bytes();
 
-        // --- 2. replace the internal `Map` with an ordered one -----------------
-        // Only objects can be sorted; any other variant is an error.
-        let map = value.as_object_mut().ok_or(Error::<T>::InvalidJson)?;
+        if bytes.len() > Len::get() as usize {
+            return Err(Error::<T>::JsonTooLong.into());
+        }
 
-        // `BTreeMap` keeps keys in lexicographic order,
-        // so we can just *move* the data into it and back.
-        use sp_std::collections::btree_map::BTreeMap;
-
-        let ordered: BTreeMap<_, _> = core::mem::take(map).into_iter().collect();
-        *map = ordered.into_iter().collect(); // back into the original `Map`
-
-        // --- 3. serialise back to bytes ----------------------------------------
-        let bytes = serde_json::to_vec(&value).map_err(|_| Error::<T>::InvalidJson)?;
-
-        // --- 4. enforce the length bound ---------------------------------------
-        *json = BoundedVec::<u8, Len>::try_from(bytes).map_err(|_| Error::<T>::JsonTooLong)?;
+        *json = BoundedVec::try_from(bytes.to_vec()).map_err(|_| Error::<T>::JsonTooLong)?;
 
         Ok(())
     }

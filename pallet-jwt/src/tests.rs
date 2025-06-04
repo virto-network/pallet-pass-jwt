@@ -283,13 +283,13 @@ fn test_set_jwks() {
 fn test_validate_json() {
     new_test_ext().execute_with(|| {
         // Valid JSON
-        let valid_json = bounded_vec::<MaxLengthIssuerJWKS>(r#"{"key": "value"}"#);
-        assert_ok!(Jwt::validate_json(&valid_json));
+        let mut valid_json = bounded_vec::<MaxLengthIssuerJWKS>(r#"{"key": "value"}"#);
+        assert_ok!(Jwt::validate_json(&mut valid_json));
 
         // Invalid JSON
-        let invalid_json = bounded_vec::<MaxLengthIssuerJWKS>(r#"{"key": "value""#);
+        let mut invalid_json = bounded_vec::<MaxLengthIssuerJWKS>(r#"{"key": "value""#);
         assert_noop!(
-            Jwt::validate_json(&invalid_json),
+            Jwt::validate_json(&mut invalid_json),
             Error::<Test>::InvalidJson
         );
     });
