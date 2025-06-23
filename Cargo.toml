@@ -41,6 +41,7 @@ sp-io = { version = "40.0.1" }
 sp-runtime = { version = "41.1.0" }
 sp-core = { version = "36.1.0" }
 sp-std = { version = "14.0.0" }
+sp-application-crypto = { version = "40.0.1" }
 
 # FRAME Contrib
 traits-authn = { git = "https://github.com/virto-network/frame-contrib", package = "fc-traits-authn", default-features = false }

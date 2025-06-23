@@ -1,9 +1,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use frame_support::{BoundedVec, dispatch::DispatchResult, ensure, traits::Get};
+use frame_system::offchain::{AppCrypto, CreateSignedTransaction, SendSignedTransaction, Signer};
 use frame_system::pallet_prelude::*;
 use log::info;
 pub use pallet::*;
+// use sp_application_crypto::{AppPublic, AppSignature};
+use sp_runtime::offchain::http;
 use sp_runtime::traits::AtLeast32BitUnsigned;
 
 #[cfg(test)]
@@ -27,11 +30,16 @@ pub mod pallet {
     // Configs
 
     #[pallet::config]
-    pub trait Config: frame_system::Config {
+    pub trait Config: CreateSignedTransaction<Call<Self>> + frame_system::Config {
         // Defines the event type for the pallet.
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
+        /// The type to be used for cryptographic signature related to off-chain worker.
+        type AuthorityId: AppCrypto<Self::Public, Self::Signature>;
+
         type RegisterOrigin: EnsureOrigin<Self::RuntimeOrigin, Success = Self::AccountId>;
+
+        type UpdaterOrigin: EnsureOrigin<Self::RuntimeOrigin, Success = Self::AccountId>; // It's a recommended idea to be able to accomplish this root/gobernance
 
         type BlockNumber: From<u32> + Into<u32> + AtLeast32BitUnsigned + Copy + MaxEncodedLen;
 
@@ -55,8 +63,20 @@ pub mod pallet {
         #[pallet::constant]
         type MaxProposersPerIssuer: Get<u32>;
 
+        #[pallet::constant]
+        type MinimalConsensusValidatorsPercentage: Get<u32>;
+
         /// The caller origin, overarching type of all pallets origins.
         type JwtOrigin: From<frame_system::Origin<Self>>;
+
+        // Pending to define if use this to freeze/
+        type NativeBalance: fungible::Inspect<Self::AccountId>
+            + fungible::Mutate<Self::AccountId>
+            + fungible::hold::Inspect<Self::AccountId>
+            + fungible::hold::Mutate<Self::AccountId>
+            + fungible::freeze::Inspect<Self::AccountId, Id = ()>
+            + fungible::freeze::Mutate<Self::AccountId>
+            + fungible::MutateFreeze<Self::AccountId>;
     }
 
     // Structs
@@ -146,6 +166,10 @@ pub mod pallet {
         StorageMap<_, Twox64Concat, BoundedVec<u8, T::MaxLengthIssuerDomain>, Issuer<T>>; // Domain of the issuer -> Issuer struct
 
     #[pallet::storage]
+    pub type IssuerCreator<T: Config> =
+        StorageMap<_, Twox64Concat, BoundedVec<u8, T::MaxLengthIssuerDomain>, T::AccountId>; // Domain of the issuer -> Issuer struct
+
+    #[pallet::storage]
     pub type JwksMap<T: Config> = StorageMap<
         _,
         Twox64Concat,
@@ -163,8 +187,15 @@ pub mod pallet {
 
     // Hash of the jwks => JWKS. JWKS can be reused! Saving a lot of space.
     #[pallet::storage]
-    pub type JwksHash<T: Config> =
-        StorageMap<_, Blake2_128Concat, H256, BoundedVec<u8, T::MaxLengthIssuerJWKS>>;
+    pub type JwksHash<T: Config> = StorageDoubleMap<
+        _,
+        Blake2_128Concat,
+        BoundedVec<u8, T::MaxLengthIssuerDomain>,
+        Blake2_128Concat,
+        H256,
+        BoundedVec<u8, T::MaxLengthIssuerJWKS>,
+        OptionQuery,
+    >;
 
     // IssuerDomain => Hash of the jwks proposed => Counter
     #[pallet::storage]
@@ -204,6 +235,7 @@ pub mod pallet {
         OnlyValidatorsCanProposeJWKS,
         DomainNotRegistered,
         MaxProposersPerIssuerExceeded,
+        NoValidators,
     }
 
     // Calls
@@ -236,7 +268,7 @@ pub mod pallet {
 
                 // insert the freshly built Issuer
                 *slot = Some(Issuer {
-                    open_id_url: open_id_url.clone(), // we’ll need the originals later
+                    open_id_url: open_id_url.clone(), // we'll need the originals later
                     interval_update,
                     is_enabled: true, // is_enabled by default is true
                 });
@@ -250,6 +282,27 @@ pub mod pallet {
                 Self::validate_json(&mut jwks)?;
                 JwksMap::<T>::insert(&domain, jwks);
             }
+
+            // Store the account who created the domain  // ToDo: Needed?
+            IssuerCreator::<T>::insert(&domain, who.clone());
+
+            // Set CounterIntervalUpdateIssuer storage
+            CounterIntervalUpdateIssuer::<T>::try_mutate_exists(
+                &domain,
+                |slot| -> DispatchResult {
+                    ensure!(slot.is_none(), Error::<T>::IssuerAlreadyExists);
+
+                    // Already validated interval update, not needed to be done again
+
+                    let interval_value = match interval_update {
+                        Some(value) => value,
+                        None => 0,
+                    };
+
+                    *slot = Some(interval_value);
+                    Ok(())
+                },
+            )?;
 
             Self::deposit_event(Event::<T>::IssuerRegistered { who, domain });
 
@@ -266,7 +319,7 @@ pub mod pallet {
             mut interval_update: Option<u32>,
             is_enabled: bool,
         ) -> DispatchResult {
-            let who = T::RegisterOrigin::ensure_origin(origin)?;
+            let who = T::UpdaterOrigin::ensure_origin(origin)?;
 
             //----------------------------------------------------------------------
             // 1. update the Issuer entry in ONE storage access
@@ -280,7 +333,7 @@ pub mod pallet {
                 // b) run field-level validation
                 Self::validate_interval_update(&mut interval_update);
 
-                // c) overwrite the fields (your semantics: “replace, even with None”)
+                // c) overwrite the fields (your semantics: "replace, even with None")
                 issuer.open_id_url = open_id_url.clone();
                 issuer.interval_update = interval_update;
                 issuer.is_enabled = is_enabled;
@@ -292,12 +345,33 @@ pub mod pallet {
             // 2. synchronise JWKS table
             //----------------------------------------------------------------------
             match jwks {
-                Some(new_jwks) => JwksMap::<T>::insert(&domain, new_jwks),
+                Some(mut new_jwks) => {
+                    Self::validate_json(&mut new_jwks)?;
+                    JwksMap::<T>::insert(&domain, new_jwks)
+                }
                 None => JwksMap::<T>::remove(&domain),
             }
 
             //----------------------------------------------------------------------
-            // 3. emit the event
+            // 3. CounterIntervalUpdateIssuer storage
+            //----------------------------------------------------------------------
+            CounterIntervalUpdateIssuer::<T>::try_mutate_exists(
+                &domain,
+                |maybe_slot| -> DispatchResult {
+                    // Already validated interval update, not needed to be done again
+
+                    let interval_value = match interval_update {
+                        Some(value) => value,
+                        None => 0,
+                    };
+
+                    *maybe_slot = Some(interval_value);
+                    Ok(())
+                },
+            )?;
+
+            //----------------------------------------------------------------------
+            // 4. emit the event
             //----------------------------------------------------------------------
             Self::deposit_event(Event::<T>::IssuerUpdated { who, domain });
             Ok(())
@@ -309,18 +383,19 @@ pub mod pallet {
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
         ) -> DispatchResult {
-            let who = T::RegisterOrigin::ensure_origin(origin)?;
+            let who = T::UpdaterOrigin::ensure_origin(origin)?;
 
             // ── 1. remove from IssuerMap in one storage access ────────────────────
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
                 ensure!(maybe_issuer.is_some(), Error::<T>::IssuerDoesNotExist);
                 *maybe_issuer = None; // delete the key
                 Ok(())
-            })?; // ← propagates the “does not exist” error
+            })?; // ← propagates the "does not exist" error
 
             // ── 2. clean up auxiliary tables (they may or may not be present) ─────
             JwksMap::<T>::remove(&domain);
             CounterIntervalUpdateIssuer::<T>::remove(&domain);
+            IssuerCreator::<T>::remove(&domain);
 
             // ── 3. emit an event ──────────────────────────────────────────────────
             Self::deposit_event(Event::<T>::IssuerDeleted { who, domain });
@@ -335,7 +410,7 @@ pub mod pallet {
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             mut interval_update: Option<u32>,
         ) -> DispatchResult {
-            let who = T::RegisterOrigin::ensure_origin(origin)?;
+            let who = T::UpdaterOrigin::ensure_origin(origin)?;
 
             // Check if the issuer exists
             if !IssuerMap::<T>::contains_key(&domain) {
@@ -359,6 +434,21 @@ pub mod pallet {
                 Ok(())
             })?;
 
+            CounterIntervalUpdateIssuer::<T>::try_mutate_exists(
+                &domain,
+                |maybe_slot| -> DispatchResult {
+                    // Already validated interval update, not needed to be done again
+
+                    let interval_value = match interval_update {
+                        Some(value) => value,
+                        None => 0,
+                    };
+
+                    *maybe_slot = Some(interval_value);
+                    Ok(())
+                },
+            )?;
+
             Self::deposit_event(Event::<T>::IssuerIntervalUpdateUpdated {
                 who,
                 domain,
@@ -375,7 +465,7 @@ pub mod pallet {
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             is_enabled: bool,
         ) -> DispatchResult {
-            let who = T::RegisterOrigin::ensure_origin(origin)?;
+            let who = T::UpdaterOrigin::ensure_origin(origin)?;
 
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
                 // fail if the domain is unknown
@@ -409,7 +499,7 @@ pub mod pallet {
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
             open_id_url: BoundedVec<u8, T::MaxLengthIssuerOpenIdURL>,
         ) -> DispatchResult {
-            let who = T::RegisterOrigin::ensure_origin(origin)?;
+            let who = T::UpdaterOrigin::ensure_origin(origin)?;
 
             // ── 2. mutate the issuer entry atomically ────────────────────────────
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
@@ -438,10 +528,10 @@ pub mod pallet {
         pub fn propose_jwks(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
-            jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
+            mut jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
         ) -> DispatchResult {
             //------------------------------------------------------------------
-            // 0. origin – only validators are allowed to call this
+            // 0. origin – only validators should be allowed to call this
             //------------------------------------------------------------------
             let who = ensure_signed(origin)?;
             ensure!(
@@ -460,6 +550,7 @@ pub mod pallet {
             //------------------------------------------------------------------
             // 2. hash the JWKS document so we can deduplicate storage
             //------------------------------------------------------------------
+            Self::validate_json(&mut jwks)?;
             let jwks_hash = H256::from(blake2_256(jwks.as_slice()));
 
             //------------------------------------------------------------------
@@ -482,9 +573,9 @@ pub mod pallet {
             })?;
 
             //------------------------------------------------------------------
-            // 4. store the JWKS bytes if we haven’t seen this hash before
+            // 4. store the JWKS bytes if we haven't seen this hash before
             //------------------------------------------------------------------
-            JwksHash::<T>::try_mutate(jwks_hash, |slot| -> DispatchResult {
+            JwksHash::<T>::try_mutate(&domain, jwks_hash, |slot| -> DispatchResult {
                 if slot.is_none() {
                     *slot = Some(jwks.clone());
                 }
@@ -510,16 +601,18 @@ pub mod pallet {
             Ok(())
         }
 
+        // This should be called only by governance
         #[pallet::call_index(7)]
         #[pallet::weight(Weight::default())] // #[pallet::weight(<T as Config>::WeightInfo::set_jwks())]   // replace with Weight::default() until you benchmark
         pub fn set_jwks(
             origin: OriginFor<T>,
             domain: BoundedVec<u8, T::MaxLengthIssuerDomain>,
+            mut jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
         ) -> DispatchResult {
             //------------------------------------------------------------------
             // 0. origin.
             //------------------------------------------------------------------
-            let who = ensure_signed(origin)?;
+            let who = ensure_signed(origin)?; // ToDo: Signed by sudo/governance?
             ensure!(
                 T::Validators::validators().contains(&who),
                 Error::<T>::OnlyValidatorsCanProposeJWKS
@@ -534,24 +627,20 @@ pub mod pallet {
             );
 
             //------------------------------------------------------------------
-            // 2. pick the JWKS with the highest vote count
+            // 2. Validate JWKS
             //------------------------------------------------------------------
-            let winning_jwks: Option<BoundedVec<u8, T::MaxLengthIssuerJWKS>> =
-                Some(Self::get_jwks_with_higher_count(&domain));
-
-            // No JWKS proposals yet?
-            let winning_jwks = winning_jwks.ok_or(Error::<T>::AlreadyProposedForJWKS)?; // or introduce a new error
+            Self::validate_json(&mut jwks)?;
 
             //------------------------------------------------------------------
             // 3. write to JwksMap only if it changed
             //------------------------------------------------------------------
             let mut changed: bool = false;
             JwksMap::<T>::try_mutate(&domain, |slot| -> DispatchResult {
-                if slot.as_ref() == Some(&winning_jwks) {
+                if slot.as_ref() == Some(&jwks) {
                     // No change, skip write & later event
                     return Ok(());
                 }
-                *slot = Some(winning_jwks.clone());
+                *slot = Some(jwks.clone());
                 changed = true;
                 Ok(())
             })?;
@@ -579,41 +668,68 @@ pub mod pallet {
             info!("Cleaning all JWKS proposals");
         }
 
-        // fn on_initialize(n: BlockNumberFor<T>) {
-        //     info!("Initializing the offchain worker for getting the jwks from internet");
-        //     // Iterate on all the registered issuers
-        //     for issuer in IssuerMap::<T>::iter() {
-        //         if !issuer.1.is_enabled || issuer.1.interval_update.is_none() || issuer.1.interval_update.unwrap() == 0 {
-        //             continue;
-        //         }
+        fn offchain_worker(n: BlockNumberFor<T>) {
+            info!("Running offchain worker at block {}", n);
 
-        //         let jskw_url;
-        //         // Get the open id url
-        //         let open_id_url = Self::get_open_id_url(&issuer.name);
-        //         if let Some(open_id_url) = open_id_url {
-        //             if let Some(jwks_url) = jwks_url {
-        //                 // Get the jwks from the internet
-        //                 // let jwks = Self::get_jwks_from_internet(jwks_url);
-        //             }
-        //         } else {
-        //             jskw_url = Self::get_jwks_url(&issuer.name);
-        //             if let Some(jwks_url) = jwks_url {
-        //                 // Get the jwks from the internet
-        //                 // let jwks = Self::get_jwks_from_internet(jwks_url);
-        //             } else {
-        //                 info!("No jwks url found for issuer {:?}", issuer.name);
-        //                 continue; // Continue to the next issuer, JWKS is not provided and can not get fetched from internet
-        //             }
-        //         }
-        //         // Store the jwks in the proposal storage(JwksProposals)
-        //         // JwksProposals::<T>::insert((issuer.name, jwks_url, who), ());
+            // Check if not proposed yet for this domain
+            // let validators = T::Validators::validators();
 
-        //     }
-        // }
+            // Get validator account from keystore
+            let signer = Signer::<T, T::AuthorityId>::any_account();
+
+            // Iterate on all the registered issuers
+            for issuer in IssuerMap::<T>::iter() {
+                // Check if issuer is disabled or there is no interval update
+                let interval_update = match issuer.1.interval_update {
+                    Some(iu) if issuer.1.is_enabled && iu > 0 => iu,
+                    _ => continue,
+                };
+
+                // Check if it's NOT time to update -> The time to propose is 1 block before
+                let current_counter = CounterIntervalUpdateIssuer::<T>::get(&issuer.0);
+                if current_counter != interval_update.saturating_sub(1) {
+                    continue;
+                }
+
+                // if !Self::not_yet_proposed(&issuer.0, &validator_account) {
+                //     // This means it has already proposed for this domain
+                //     continue;
+                // }
+
+                // Process this issuer
+                if let Some(open_id_url) = &issuer.1.open_id_url {
+                    if let Ok(url_str) = sp_std::str::from_utf8(open_id_url.as_slice()) {
+                        if let Err(e) = Self::fetch_and_propose_jwks(&signer, url_str, &issuer.0) {
+                            log::error!("Failed to fetch JWKS for {}: {:?}", url_str, e);
+                        }
+                    }
+                }
+
+                // Increase number if processed
+                CounterIntervalUpdateIssuer::<T>::mutate(&issuer.0, |counter| {
+                    *counter = (*counter + 1) % issuer.1.interval_update.unwrap();
+                });
+            }
+        }
+
+        fn on_initialize(_n: BlockNumberFor<T>) -> Weight {
+            Weight::default()
+        }
     }
 }
 
 impl<T: Config> Pallet<T> {
+    // fn not_yet_proposed( // Maybe not necessary
+    //     domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
+    //     validator_account: &T::AccountId,
+    // ) -> bool {
+    //     let proposers = AccountsProposedForIssuer::<T>::get(&domain);
+    //     match proposers {
+    //         Some(validators_list) => validators_list.contains(&validator_account),
+    //         None => true,
+    //     }
+    // }
+
     pub fn validate_json<Len>(json: &mut BoundedVec<u8, Len>) -> DispatchResult
     where
         Len: Get<u32>,
@@ -656,7 +772,7 @@ impl<T: Config> Pallet<T> {
     /// Return the JWKS document that has the highest proposal count for
     /// the given issuer domain.  
     /// If the issuer has no JWKS proposals yet, this returns an *empty*
-    /// `BoundedVec`, which the caller can interpret as “no winner”.
+    /// `BoundedVec`, which the caller can interpret as "no winner".
     pub fn get_jwks_with_higher_count(
         issuer_domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
     ) -> BoundedVec<u8, T::MaxLengthIssuerJWKS> {
@@ -674,7 +790,7 @@ impl<T: Config> Pallet<T> {
 
         // 2. Resolve the winning hash back to raw JWKS bytes
         if let Some((winning_hash, _)) = best {
-            if let Some(jwks) = JwksHash::<T>::get(winning_hash) {
+            if let Some(jwks) = JwksHash::<T>::get(issuer_domain, winning_hash) {
                 return jwks; // ← success path
             }
         }
@@ -709,5 +825,76 @@ impl<T: Config> Pallet<T> {
         } else {
             None
         }
+    }
+
+    fn fetch_and_propose_jwks(
+        // ToDo: optimize memory usage -> avoid clones and json Value usages.
+        signer: &Signer<T, T::AuthorityId>,
+        open_id_url: &str,
+        domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
+    ) -> Result<(), sp_runtime::DispatchError> {
+        // 1. Fetch OpenID configuration
+        let openid_config = Self::fetch_json(open_id_url)?;
+
+        // 2. Extract jwks_uri from OpenID configuration
+        let jwks_uri = openid_config
+            .get("jwks_uri")
+            .and_then(|v| v.as_str())
+            .ok_or(Error::<T>::InvalidJson)?;
+
+        // 3. Fetch JWKS from jwks_uri
+        let jwks = Self::fetch_json(jwks_uri)?;
+
+        // 4. Convert JWKS to BoundedVec
+        let jwks_str = jwks.to_string();
+        let jwks_bytes = jwks_str.as_bytes();
+        let bounded_jwks = BoundedVec::<u8, T::MaxLengthIssuerJWKS>::try_from(jwks_bytes.to_vec())
+            .map_err(|_| Error::<T>::IssuerJWKSTooLong)?;
+
+        // // 5. Validate JSON format
+        // Self::validate_json(&mut bounded_jwks.clone())?;
+
+        // 6. Propose the JWKS
+        // Send extrinsic to propose_jwks using the validator account
+        let _results = signer.send_signed_transaction(move |_account| {
+            // Received price is wrapped into a call to `submit_price` public function of this
+            // pallet. This means that the transaction, when executed, will simply call that
+            // function passing `price` as an argument.
+            Call::propose_jwks {
+                domain: domain.clone(),
+                jwks: bounded_jwks.clone(),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn fetch_json(url: &str) -> Result<serde_json::Value, sp_runtime::DispatchError> {
+        // Create HTTP request
+        let request = http::Request::get(url);
+
+        // Send request and wait for response
+        let pending = request
+            .add_header("Accept", "application/json")
+            .send()
+            .map_err(|_| Error::<T>::InvalidJson)?;
+
+        // Wait for the response
+        let response = pending
+            .try_wait(None)
+            .map_err(|_| Error::<T>::InvalidJson)?
+            .map_err(|_| Error::<T>::InvalidJson)?;
+
+        // Check if request was successful
+        if response.code != 200 {
+            return Err(Error::<T>::InvalidJson.into());
+        }
+
+        // Get response body and read it into a Vec<u8>
+        let response_body = response.body();
+        let body_data: Vec<u8> = response_body.collect();
+        let json_value = serde_json::from_slice::<serde_json::Value>(&body_data)
+            .map_err(|_| Error::<T>::InvalidJson)?;
+        Ok(json_value)
     }
 }

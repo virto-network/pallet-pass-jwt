@@ -4,6 +4,7 @@
 
 use crate as pallet_jwt;
 
+use codec::{Decode, Encode};
 use frame_support::{
     derive_impl,
     parameter_types,
@@ -11,9 +12,17 @@ use frame_support::{
     traits::{ConstU32, ConstU64, Everything},
     weights::constants::RocksDbWeight,
 };
-use frame_system::mocking::MockBlock;
+use frame_system::{
+    mocking::MockBlock,
+    offchain::{AppCrypto, CreateSignedTransaction, CreateTransactionBase, SigningTypes},
+};
 use pallet_session;
-use sp_runtime::BuildStorage;
+use scale_info::TypeInfo;
+use sp_application_crypto::{AppPublic, AppSignature};
+use sp_runtime::{
+    BuildStorage, generic::UncheckedExtrinsic, testing::UintAuthorityId,
+    transaction_validity::TransactionValidity,
+};
 
 // ─────────────────────────────────────────
 // Type aliases
@@ -21,6 +30,8 @@ use sp_runtime::BuildStorage;
 pub type AccountId = u64;
 pub type Balance = u128;
 pub type BlockNumber = u32;
+pub type Signature = UintAuthorityId;
+pub type Public = UintAuthorityId;
 
 // ─────────────────────────────────────────
 // Test runtime
@@ -64,6 +75,8 @@ parameter_types! {
     pub const MaxUpdateInterval: u32          = 1_000;
     pub const MaxProposersPerIssuer: u32      = 10;
     pub const ExistentialDeposit: Balance     = 1;
+
+    pub const MinimalConsensusValidatorsPercentage: u32 = 70;
 }
 
 // ─────────────────────────────────────────
@@ -107,6 +120,36 @@ impl pallet_session::Config for Test {
 }
 
 // ─────────────────────────────────────────
+// SigningTypes implementation
+// ─────────────────────────────────────────
+impl SigningTypes for Test {
+    type Public = Public;
+    type Signature = Signature;
+}
+
+// ─────────────────────────────────────────
+// CreateTransactionBase implementation
+// ─────────────────────────────────────────
+impl CreateTransactionBase<pallet_jwt::Call<Test>> for Test {
+    type Extrinsic = sp_runtime::testing::TestXt<pallet_jwt::Call<Test>, ()>;
+    type RuntimeCall = pallet_jwt::Call<Test>;
+}
+
+// ─────────────────────────────────────────
+// CreateSignedTransaction implementation
+// ─────────────────────────────────────────
+impl CreateSignedTransaction<pallet_jwt::Call<Test>> for Test {
+    fn create_signed_transaction<C: AppCrypto<Self::Public, Self::Signature>>(
+        call: pallet_jwt::Call<Test>,
+        _public: Self::Public,
+        _account: Self::AccountId,
+        _nonce: u32,
+    ) -> Option<UncheckedExtrinsic<u64, pallet_jwt::Call<Test>, (), ()>> {
+        None
+    }
+}
+
+// ─────────────────────────────────────────
 // pallet_jwt::Config
 // ─────────────────────────────────────────
 impl pallet_jwt::Config for Test {
@@ -119,8 +162,12 @@ impl pallet_jwt::Config for Test {
     type MaxUpdateInterval = MaxUpdateInterval;
     type MaxProposersPerIssuer = MaxProposersPerIssuer;
     type RegisterOrigin = frame_system::EnsureSigned<AccountId>;
+    type UpdaterOrigin = frame_system::EnsureSigned<AccountId>;
     type JwtOrigin = RuntimeOrigin;
     type Validators = pallet_session::Pallet<Test>;
+    type NativeBalance = Balances;
+    type AuthorityId = UintAuthorityId;
+    type MinimalConsensusValidatorsPercentage = MinimalConsensusValidatorsPercentage;
 }
 
 // ─────────────────────────────────────────
