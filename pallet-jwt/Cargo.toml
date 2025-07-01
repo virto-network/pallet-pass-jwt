@@ -16,7 +16,12 @@ frame.workspace = true
 pallet-balances.workspace = true
 sp-io.workspace = true
 sp-runtime.workspace = true
+sp-application-crypto.workspace = true
 log.workspace = true
+sp-std.workspace = true
+serde_json.workspace = true
+pallet-session.workspace = true
+miniserde.workspace = true
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
