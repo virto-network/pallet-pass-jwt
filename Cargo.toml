@@ -21,6 +21,7 @@ base64 = { version = "0.22" }
 rand = { version = "0.9.1" }
 log = { version = "0.4.22" }
 serde_json = { version = "1.0.130" }
+miniserde = { version = "0.1.1" }
 
 # FRAME
 codec = { package = "parity-scale-codec", version = "3.7.5", default-features = false, features = [

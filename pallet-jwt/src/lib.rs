@@ -1,13 +1,20 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+use alloc::vec::Vec;
+
 use frame_support::{BoundedVec, dispatch::DispatchResult, ensure, traits::Get};
 use frame_system::offchain::{AppCrypto, CreateSignedTransaction, SendSignedTransaction, Signer};
 use frame_system::pallet_prelude::*;
 use log::info;
+use miniserde::json;
 pub use pallet::*;
 // use sp_application_crypto::{AppPublic, AppSignature};
-use sp_runtime::offchain::http;
+use sp_runtime::offchain::{Duration, http};
 use sp_runtime::traits::AtLeast32BitUnsigned;
+
+pub mod types;
+use types::*;
 
 #[cfg(test)]
 mod mock;
@@ -66,7 +73,7 @@ pub mod pallet {
         type MaxProposersPerIssuer: Get<u32>;
 
         #[pallet::constant]
-        type MinimalConsensusValidatorsPercentage: Get<u32>;
+        type MinimalConsensusPercentage: Get<u32>;
 
         /// The caller origin, overarching type of all pallets origins.
         type JwtOrigin: From<frame_system::Origin<Self>>;
@@ -79,24 +86,6 @@ pub mod pallet {
             + fungible::freeze::Inspect<Self::AccountId, Id = ()>
             + fungible::freeze::Mutate<Self::AccountId>
             + fungible::MutateFreeze<Self::AccountId>;
-    }
-
-    // Enum URL type
-    #[derive(
-        Clone,
-        Debug,
-        PartialEq,
-        TypeInfo,
-        Encode,
-        Decode,
-        DecodeWithMemTracking,
-        MaxEncodedLen,
-        Default,
-    )]
-    pub enum UrlType {
-        JWKS,
-        #[default]
-        OPENID,
     }
     // Structs
     #[derive(Clone, Debug, PartialEq, TypeInfo, Encode, Decode, MaxEncodedLen, Default)]
@@ -733,13 +722,60 @@ pub mod pallet {
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         fn on_finalize(_n: BlockNumberFor<T>) {
-            // Set the jwks in the JwksMap
-            // Self::set_jwks();
-
-            // Clear all JWKS proposals
-            // JwksProposals::<T>::clear();
-
             info!("Cleaning all JWKS proposals");
+            // For each issuer in IssuerMap
+            for (domain, issuer) in IssuerMap::<T>::iter() {
+                // Get the current counter for this issuer
+                CounterIntervalUpdateIssuer::<T>::mutate(&domain, |counter| {
+                    if *counter > 0 {
+                        // Decrease by 1 if greater than 0
+                        *counter -= 1;
+                    } else {
+                        // If counter is 0, reset to interval_update (if set)
+                        if let Some(interval) = issuer.interval_update {
+                            *counter = interval;
+                        }
+
+                        // Only proceed if counter was zero (i.e., time to process)
+                        // Check if DomainAccsVec count >= MinimalConsensusPercentage
+                        let min_consensus = T::MinimalConsensusPercentage::get();
+                        if let Some(accs_vec) = DomainAccsVec::<T>::get(&domain) {
+                            if accs_vec.len() as u32 >= min_consensus {
+                                // Find the Hash with the greatest value in CounterProposedJwksHash
+                                let mut max_count = 0u32;
+                                let mut selected_hash = None;
+                                for (hash, count) in
+                                    CounterProposedJwksHash::<T>::iter_prefix(&domain)
+                                {
+                                    if count > max_count {
+                                        max_count = count;
+                                        selected_hash = Some(hash);
+                                    }
+                                }
+
+                                if let Some(hash) = selected_hash {
+                                    // Copy the value for that Hash in JwksHash into JwksMap
+                                    if let Some(jwks) = JwksHash::<T>::get(&domain, &hash) {
+                                        // Overwrite JwksMap for this domain
+                                        let _ = JwksMap::<T>::insert(&domain, jwks);
+                                    }
+                                }
+
+                                // Clear the storage for the issuer in the relevant storages
+                                let _ = DomainAccsVec::<T>::remove(&domain);
+                                let _ = JwksHash::<T>::clear_prefix(&domain, u32::MAX, None);
+                                let _ = CounterProposedJwksHash::<T>::clear_prefix(
+                                    &domain,
+                                    u32::MAX,
+                                    None,
+                                );
+                                let _ =
+                                    DomainAccJwksHash::<T>::clear_prefix(&domain, u32::MAX, None);
+                            }
+                        }
+                    }
+                });
+            }
         }
 
         fn offchain_worker(n: BlockNumberFor<T>) {
@@ -878,65 +914,80 @@ impl<T: Config> Pallet<T> {
         url: &str,
         domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
         url_type: UrlType,
-    ) -> Result<(), sp_runtime::DispatchError> {
-        let jwks = match url_type {
+    ) -> Result<(), http::Error> {
+        let jwks_uri = match url_type {
             UrlType::OPENID => {
-                // 1. Fetch OpenID configuration
+                // Fetch OpenID configuration
                 let openid_config = Self::fetch_openid_json(url)?;
 
-                // 2. Extract jwks_uri from OpenID configuration
-                let jwks_uri = openid_config
-                    .get("jwks_uri")
-                    .and_then(|v| v.as_str())
-                    .ok_or(Error::<T>::InvalidJson)?;
-
-                // 3. Fetch JWKS from jwks_uri
-                Self::fetch_jwks_json(jwks_uri)?
+                // Extract jwks_uri from OpenID configuration
+                openid_config.jwks_uri
             }
             UrlType::JWKS => {
                 // Directly fetch JWKS from the provided URL
-                Self::fetch_jwks_json(url)?
+                url.to_string()
             }
         };
+
+        // 3. Fetch JWKS from jwks_uri
+        let jwks = Self::fetch_jwks_json(&jwks_uri)?;
+
+        let jwks_bytes = json::to_string(&jwks).into_bytes();
+        let jwks_bound_vec = BoundedVec::<u8, T::MaxLengthIssuerJWKS>::try_from(jwks_bytes)
+            .map_err(|_| http::Error::Unknown)?;
+
+        // ToDo: Search the H256(jwks) for the signer to check if already proposed this recently
+        // ToDo: Store in local storage the jwks proposed to avoid propose already proposed values.
 
         // 4. Propose the JWKS
         // Send extrinsic to propose_jwks using the validator account
         let _results = signer.send_signed_transaction(move |_account| Call::propose_jwks {
             domain: domain.clone(),
-            jwks: jwks.clone(),
+            jwks: jwks_bound_vec.clone(),
         });
 
         Ok(())
     }
 
     /// Make HTTP request with optimized error handling
-    fn make_http_request(url: &str) -> Result<Vec<u8>, sp_runtime::DispatchError> {
-        let response = http::Request::get(url)
-            .add_header("Accept", "application/json")
-            .send()
-            .map_err(|_| Error::<T>::InvalidJson)?
-            .try_wait(None)
-            .map_err(|_| Error::<T>::InvalidJson)?
-            .map_err(|_| Error::<T>::InvalidJson)?;
+    fn make_http_request(url: &str) -> Result<String, http::Error> {
+        let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000)); // ToDo: Think about this hardcoded value
+        let request = http::Request::get(url);
 
-        // Check if request was successful
+        let pending = request
+            .deadline(deadline)
+            .send()
+            .map_err(|_| http::Error::IoError)?;
+
+        let response = pending
+            .try_wait(deadline)
+            .map_err(|_| http::Error::DeadlineReached)??;
         if response.code != 200 {
-            return Err(Error::<T>::InvalidJson.into());
+            log::warn!("Unexpected status code: {}", response.code);
+            return Err(http::Error::Unknown);
         }
 
+        // Next we want to fully read the response body and collect it to a vector of bytes.
+        // Note that the return object allows you to read the body in chunks as well
+        // with a way to control the deadline.
+        let body = response.body().collect::<Vec<u8>>();
+
+        // Create a str slice from the body.
+        let body_str = alloc::str::from_utf8(&body).map_err(|_| {
+            log::warn!("No UTF8 body");
+            http::Error::Unknown
+        })?;
         // Collect response body efficiently
-        Ok(response.body().collect())
+        Ok(body_str.to_owned())
     }
 
-    fn fetch_openid_json(url: &str) -> Result<serde_json::Value, sp_runtime::DispatchError> {
+    fn fetch_openid_json(url: &str) -> Result<OpenIdConfig, http::Error> {
         let response_data = Self::make_http_request(url)?;
-        serde_json::from_slice(&response_data).map_err(|_| Error::<T>::InvalidJson.into())
+        json::from_str(&response_data).map_err(|_| http::Error::Unknown)
     }
 
-    fn fetch_jwks_json(
-        url: &str,
-    ) -> Result<BoundedVec<u8, T::MaxLengthIssuerJWKS>, sp_runtime::DispatchError> {
+    fn fetch_jwks_json(url: &str) -> Result<Jwks, http::Error> {
         let response_data = Self::make_http_request(url)?;
-        BoundedVec::try_from(response_data).map_err(|_| Error::<T>::InvalidJson.into())
+        json::from_str(&response_data).map_err(|_| http::Error::Unknown)
     }
 }
