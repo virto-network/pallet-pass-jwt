@@ -2,9 +2,8 @@
 
 #![cfg(test)]
 
-use crate as pallet_jwt;
+use crate::{self as pallet_jwt, crypto};
 
-use codec::{Decode, Encode};
 use frame_support::{
     derive_impl,
     parameter_types,
@@ -17,12 +16,7 @@ use frame_system::{
     offchain::{AppCrypto, CreateSignedTransaction, CreateTransactionBase, SigningTypes},
 };
 use pallet_session;
-use scale_info::TypeInfo;
-use sp_application_crypto::{AppPublic, AppSignature};
-use sp_runtime::{
-    BuildStorage, generic::UncheckedExtrinsic, testing::UintAuthorityId,
-    transaction_validity::TransactionValidity,
-};
+use sp_runtime::{BuildStorage, generic::UncheckedExtrinsic, testing::UintAuthorityId};
 
 // ─────────────────────────────────────────
 // Type aliases
@@ -69,14 +63,14 @@ mod test_runtime {
 parameter_types! {
     pub const BlockHashCount: u64             = 250;
     pub const MaxLengthIssuerDomain: u32      = 100;
-    pub const MaxLengthIssuerOpenIdURL: u32   = 200;
+    pub const MaxLengthIssuerURL: u32   = 200;
     pub const MaxLengthIssuerJWKS: u32        = 1_000;
     pub const MinUpdateInterval: u32          = 10;
     pub const MaxUpdateInterval: u32          = 1_000;
     pub const MaxProposersPerIssuer: u32      = 10;
     pub const ExistentialDeposit: Balance     = 1;
 
-    pub const MinimalConsensusValidatorsPercentage: u32 = 70;
+    pub const MinimalConsensusPercentage: u32 = 70;
 }
 
 // ─────────────────────────────────────────
@@ -156,18 +150,19 @@ impl pallet_jwt::Config for Test {
     type RuntimeEvent = RuntimeEvent;
     type BlockNumber = BlockNumber;
     type MaxLengthIssuerDomain = MaxLengthIssuerDomain;
-    type MaxLengthIssuerOpenIdURL = MaxLengthIssuerOpenIdURL;
+    type MaxLengthIssuerURL = MaxLengthIssuerURL;
     type MaxLengthIssuerJWKS = MaxLengthIssuerJWKS;
     type MinUpdateInterval = MinUpdateInterval;
     type MaxUpdateInterval = MaxUpdateInterval;
     type MaxProposersPerIssuer = MaxProposersPerIssuer;
     type RegisterOrigin = frame_system::EnsureSigned<AccountId>;
     type UpdaterOrigin = frame_system::EnsureSigned<AccountId>;
+    type ProposerOrigin = frame_system::EnsureSigned<AccountId>;
     type JwtOrigin = RuntimeOrigin;
     type Validators = pallet_session::Pallet<Test>;
     type NativeBalance = Balances;
-    type AuthorityId = UintAuthorityId;
-    type MinimalConsensusValidatorsPercentage = MinimalConsensusValidatorsPercentage;
+    type AuthorityId = crypto::TestAuthId;
+    type MinimalConsensusPercentage = MinimalConsensusPercentage;
 }
 
 // ─────────────────────────────────────────

@@ -10,6 +10,7 @@ use log::info;
 use miniserde::json;
 pub use pallet::*;
 // use sp_application_crypto::{AppPublic, AppSignature};
+use sp_runtime::KeyTypeId;
 use sp_runtime::offchain::{Duration, http};
 use sp_runtime::traits::AtLeast32BitUnsigned;
 
@@ -24,6 +25,39 @@ mod tests;
 
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
+
+pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"jwks");
+
+/// Based on the above `KeyTypeId` we need to generate a pallet-specific crypto type wrappers.
+/// We can use from supported crypto kinds (`sr25519`, `ed25519` and `ecdsa`) and augment
+/// the types with this pallet-specific identifier.
+pub mod crypto {
+    use super::KEY_TYPE;
+    use sp_core::sr25519::Signature as Sr25519Signature;
+    use sp_runtime::{
+        MultiSignature, MultiSigner,
+        app_crypto::{app_crypto, sr25519},
+        traits::Verify,
+    };
+    app_crypto!(sr25519, KEY_TYPE);
+
+    pub struct TestAuthId;
+
+    impl frame_system::offchain::AppCrypto<MultiSigner, MultiSignature> for TestAuthId {
+        type RuntimeAppPublic = Public;
+        type GenericSignature = sp_core::sr25519::Signature;
+        type GenericPublic = sp_core::sr25519::Public;
+    }
+
+    // implemented for mock runtime in test
+    impl frame_system::offchain::AppCrypto<<Sr25519Signature as Verify>::Signer, Sr25519Signature>
+        for TestAuthId
+    {
+        type RuntimeAppPublic = Public;
+        type GenericSignature = sp_core::sr25519::Signature;
+        type GenericPublic = sp_core::sr25519::Public;
+    }
+}
 
 #[frame::pallet]
 pub mod pallet {
@@ -726,55 +760,53 @@ pub mod pallet {
             // For each issuer in IssuerMap
             for (domain, issuer) in IssuerMap::<T>::iter() {
                 // Get the current counter for this issuer
-                CounterIntervalUpdateIssuer::<T>::mutate(&domain, |counter| {
-                    if *counter > 0 {
-                        // Decrease by 1 if greater than 0
-                        *counter -= 1;
-                    } else {
-                        // If counter is 0, reset to interval_update (if set)
-                        if let Some(interval) = issuer.interval_update {
-                            *counter = interval;
-                        }
-
-                        // Only proceed if counter was zero (i.e., time to process)
-                        // Check if DomainAccsVec count >= MinimalConsensusPercentage
-                        let min_consensus = T::MinimalConsensusPercentage::get();
-                        if let Some(accs_vec) = DomainAccsVec::<T>::get(&domain) {
-                            if accs_vec.len() as u32 >= min_consensus {
-                                // Find the Hash with the greatest value in CounterProposedJwksHash
-                                let mut max_count = 0u32;
-                                let mut selected_hash = None;
-                                for (hash, count) in
-                                    CounterProposedJwksHash::<T>::iter_prefix(&domain)
-                                {
-                                    if count > max_count {
-                                        max_count = count;
-                                        selected_hash = Some(hash);
+                if let Some(interval) = issuer.interval_update {
+                    CounterIntervalUpdateIssuer::<T>::mutate(&domain, |counter| {
+                        *counter = (*counter + 1) % interval; // Increase counter by one
+                        if 0 == *counter && issuer.is_enabled {
+                            // Only proceed if counter was zero (i.e., time to process)
+                            // Check if DomainAccsVec count >= MinimalConsensusPercentage
+                            let min_consensus = T::MinimalConsensusPercentage::get();
+                            if let Some(accs_vec) = DomainAccsVec::<T>::get(&domain) {
+                                if accs_vec.len() as u32 >= min_consensus {
+                                    // Find the Hash with the greatest value in CounterProposedJwksHash
+                                    let mut max_count = 0u32;
+                                    let mut selected_hash = None;
+                                    for (hash, count) in
+                                        CounterProposedJwksHash::<T>::iter_prefix(&domain)
+                                    {
+                                        if count > max_count {
+                                            max_count = count;
+                                            selected_hash = Some(hash);
+                                        }
                                     }
-                                }
 
-                                if let Some(hash) = selected_hash {
-                                    // Copy the value for that Hash in JwksHash into JwksMap
-                                    if let Some(jwks) = JwksHash::<T>::get(&domain, &hash) {
-                                        // Overwrite JwksMap for this domain
-                                        let _ = JwksMap::<T>::insert(&domain, jwks);
+                                    if let Some(hash) = selected_hash {
+                                        // Copy the value for that Hash in JwksHash into JwksMap
+                                        if let Some(jwks) = JwksHash::<T>::get(&domain, &hash) {
+                                            // Overwrite JwksMap for this domain
+                                            let _ = JwksMap::<T>::insert(&domain, jwks);
+                                        }
                                     }
-                                }
 
-                                // Clear the storage for the issuer in the relevant storages
-                                let _ = DomainAccsVec::<T>::remove(&domain);
-                                let _ = JwksHash::<T>::clear_prefix(&domain, u32::MAX, None);
-                                let _ = CounterProposedJwksHash::<T>::clear_prefix(
-                                    &domain,
-                                    u32::MAX,
-                                    None,
-                                );
-                                let _ =
-                                    DomainAccJwksHash::<T>::clear_prefix(&domain, u32::MAX, None);
+                                    // Clear the storage for the issuer in the relevant storages
+                                    let _ = DomainAccsVec::<T>::remove(&domain);
+                                    let _ = JwksHash::<T>::clear_prefix(&domain, u32::MAX, None);
+                                    let _ = CounterProposedJwksHash::<T>::clear_prefix(
+                                        &domain,
+                                        u32::MAX,
+                                        None,
+                                    );
+                                    let _ = DomainAccJwksHash::<T>::clear_prefix(
+                                        &domain,
+                                        u32::MAX,
+                                        None,
+                                    );
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
 
@@ -799,22 +831,31 @@ pub mod pallet {
                 let url_type = &issuer.1.url_type;
 
                 if let Ok(url_str) = sp_std::str::from_utf8(url.as_slice()) {
-                    if let Err(e) =
-                        Self::fetch_and_propose_jwks(&signer, url_str, &issuer.0, url_type.clone())
-                    {
-                        log::error!("Failed to fetch JWKS for {}: {:?}", url_str, e);
+                    if let Ok(fetched_jwks) = Self::fetch_jwks(url_str, url_type.clone()) {
+                        if false == Self::is_same_jwks_as_before(&signer, &issuer.0, &fetched_jwks)
+                        {
+                            let res = Self::new_propose(&signer, &issuer.0.clone(), fetched_jwks);
+                            if let Err(e) = res {
+                                log::error!(
+                                    "Failed to propose JWKS for domain {:?}: {:?}",
+                                    issuer.0,
+                                    e
+                                );
+                            }
+                        } else {
+                            log::info!(
+                                "Already proposed same jwks for that domain, not needed to propose again."
+                            );
+                        }
+                    } else {
+                        log::error!(
+                            "Failed to fetch JWKS for domain {:?} with url {:?}",
+                            issuer.0,
+                            url_str
+                        );
                     }
                 }
-
-                // Increase number if processed
-                CounterIntervalUpdateIssuer::<T>::mutate(&issuer.0, |counter| {
-                    *counter = (*counter + 1) % issuer.1.interval_update.unwrap();
-                });
             }
-        }
-
-        fn on_initialize(_n: BlockNumberFor<T>) -> Weight {
-            Weight::default()
         }
     }
 }
@@ -824,20 +865,18 @@ impl<T: Config> Pallet<T> {
     where
         Len: Get<u32>,
     {
-        // Parse JSON (keys will be sorted automatically)
-
         // Parsing
-        let value: serde_json::Value =
-            serde_json::from_slice(json_buf.as_slice()).map_err(|_| Error::<T>::InvalidJson)?;
+        // Convert the json_buf (BoundedVec<u8, Len>) into a Jwks using miniserde::json
+        let jwks = miniserde::json::from_str::<Jwks>(
+            sp_std::str::from_utf8(json_buf.as_slice()).map_err(|_| Error::<T>::InvalidJson)?,
+        )
+        .map_err(|_| Error::<T>::InvalidJson)?;
 
-        // Serialize in compact/sorted form
-        let bytes = serde_json::to_vec(&value).map_err(|_| Error::<T>::InvalidJson)?;
-
-        // Check length
-        ensure!(bytes.len() <= Len::get() as usize, Error::<T>::JsonTooLong);
+        let jwks_str = json::to_string(&jwks);
 
         // Save the buffer
-        *json_buf = BoundedVec::<u8, Len>::try_from(bytes).map_err(|_| Error::<T>::JsonTooLong)?;
+        *json_buf = BoundedVec::<u8, Len>::try_from(jwks_str.as_bytes().to_vec())
+            .map_err(|_| Error::<T>::JsonTooLong)?;
 
         Ok(())
     }
@@ -908,13 +947,11 @@ impl<T: Config> Pallet<T> {
         }
     }
 
-    fn fetch_and_propose_jwks(
+    fn fetch_jwks(
         // ToDo: optimize memory usage -> avoid clones and json Value usages.
-        signer: &Signer<T, T::AuthorityId>,
         url: &str,
-        domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
         url_type: UrlType,
-    ) -> Result<(), http::Error> {
+    ) -> Result<BoundedVec<u8, T::MaxLengthIssuerJWKS>, http::Error> {
         let jwks_uri = match url_type {
             UrlType::OPENID => {
                 // Fetch OpenID configuration
@@ -935,7 +972,37 @@ impl<T: Config> Pallet<T> {
         let jwks_bytes = json::to_string(&jwks).into_bytes();
         let jwks_bound_vec = BoundedVec::<u8, T::MaxLengthIssuerJWKS>::try_from(jwks_bytes)
             .map_err(|_| http::Error::Unknown)?;
+        Ok(jwks_bound_vec.clone())
+    }
 
+    fn is_same_jwks_as_before(
+        signer: &Signer<T, T::AuthorityId>,
+        domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
+        jwks: &BoundedVec<u8, T::MaxLengthIssuerJWKS>,
+    ) -> bool {
+        // Check if the signer has already proposed the same hash in DomainAccJwksHash for that domain
+        // Compute the hash of the provided jwks
+        let jwks_hash = sp_core::H256::from(sp_io::hashing::blake2_256(jwks.as_slice()));
+
+        // Iterate over all accounts in the signer
+        for account in signer.accounts_from_keys() {
+            // Check if the stored hash for this domain and account matches the new hash
+            if let Some(prev_hash) = DomainAccJwksHash::<T>::get(domain, &account.id) {
+                if prev_hash == jwks_hash {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn new_propose(
+        // ToDo: optimize memory usage -> avoid clones and json Value usages.
+        signer: &Signer<T, T::AuthorityId>,
+        domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
+        jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
+    ) -> Result<(), http::Error> {
+        // ToDo: Is needed some result handling?
         // ToDo: Search the H256(jwks) for the signer to check if already proposed this recently
         // ToDo: Store in local storage the jwks proposed to avoid propose already proposed values.
 
@@ -943,7 +1010,7 @@ impl<T: Config> Pallet<T> {
         // Send extrinsic to propose_jwks using the validator account
         let _results = signer.send_signed_transaction(move |_account| Call::propose_jwks {
             domain: domain.clone(),
-            jwks: jwks_bound_vec.clone(),
+            jwks: jwks.clone(),
         });
 
         Ok(())
