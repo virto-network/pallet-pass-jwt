@@ -763,7 +763,7 @@ pub mod pallet {
                 if let Some(interval) = issuer.interval_update {
                     CounterIntervalUpdateIssuer::<T>::mutate(&domain, |counter| {
                         *counter = (*counter + 1) % interval; // Increase counter by one
-                        if interval == *counter && issuer.is_enabled {
+                        if interval == *counter && issuer.is_enabled && interval > 0 {
                             // Only proceed if counter was zero (i.e., time to process)
                             // Check if DomainAccsVec count >= MinimalConsensusPercentage
                             let min_consensus = T::MinimalConsensusPercentage::get();
