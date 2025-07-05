@@ -274,7 +274,6 @@ pub mod pallet {
     >;
 
     // Store the block counter for triggering the JWKS fetch.
-    // This is a cyclic count down from n to 0.
     #[pallet::storage]
     #[pallet::getter(fn get_counter_interval_update_issuer)]
     pub type CounterIntervalUpdateIssuer<T: Config> =
@@ -477,6 +476,21 @@ pub mod pallet {
             IssuerCreator::<T>::remove(&domain);
             JwksMap::<T>::remove(&domain);
 
+            // Remove the domain from DomainAccsVec
+            DomainAccsVec::<T>::remove(&domain);
+
+            // Remove all AccountId -> JwksHash mappings for this domain in DomainAccJwksHash
+            let _ = DomainAccJwksHash::<T>::clear_prefix(&domain, u32::MAX, None);
+
+            // Remove all JwksHash entries for this domain in JwksHash
+            let _ = JwksHash::<T>::clear_prefix(&domain, u32::MAX, None);
+
+            // Remove all CounterProposedJwksHash entries for this domain
+            let _ = CounterProposedJwksHash::<T>::clear_prefix(&domain, u32::MAX, None);
+
+            // Remove the block counter for this domain in CounterIntervalUpdateIssuer
+            CounterIntervalUpdateIssuer::<T>::remove(&domain);
+
             // ── 3. emit an event ──────────────────────────────────────────────────
             Self::deposit_event(Event::<T>::IssuerDeleted { who, domain });
 
@@ -544,6 +558,7 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = T::UpdaterOrigin::ensure_origin(origin)?;
 
+            let mut changed = false;
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
                 // fail if the domain is unknown
                 let issuer = maybe_issuer
@@ -556,15 +571,18 @@ pub mod pallet {
                 }
 
                 issuer.is_enabled = is_enabled;
+                changed = true;
                 Ok(())
             })?;
 
-            // ── 2. emit the event ────────────────────────────────────────────────
-            Self::deposit_event(Event::<T>::IssuerEnabledUpdated {
-                who,
-                domain,
-                is_enabled,
-            });
+            // ── 2. emit the event only if changed ────────────────────────────────
+            if changed {
+                Self::deposit_event(Event::<T>::IssuerEnabledUpdated {
+                    who,
+                    domain,
+                    is_enabled,
+                });
+            }
 
             Ok(())
         }
@@ -578,6 +596,7 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = T::UpdaterOrigin::ensure_origin(origin)?;
 
+            let mut changed = false;
             // ── 2. mutate the issuer entry atomically ────────────────────────────
             IssuerMap::<T>::try_mutate_exists(&domain, |maybe_issuer| -> DispatchResult {
                 // bail out if the issuer is unknown
@@ -591,11 +610,14 @@ pub mod pallet {
                 }
 
                 issuer.url = url.clone();
+                changed = true;
                 Ok(())
             })?; // any error (e.g. DoesNotExist) bubbles up
 
-            // ── 3. emit the event ────────────────────────────────────────────────
-            Self::deposit_event(Event::<T>::IssuerOpenIdURLUpdated { who, domain });
+            // ── 3. emit the event only if changed ────────────────────────────────
+            if changed {
+                Self::deposit_event(Event::<T>::IssuerOpenIdURLUpdated { who, domain });
+            }
 
             Ok(())
         }
@@ -757,18 +779,32 @@ pub mod pallet {
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         fn on_finalize(_n: BlockNumberFor<T>) {
             info!("Cleaning all JWKS proposals");
+
+            // Get the total number of validators
+            let total_validators = T::Validators::validators().len() as u32;
+            // Get the minimal consensus percentage (e.g., 50 means 50%)
+            let min_consensus_percentage = T::MinimalConsensusPercentage::get();
+
+            // Calculate the required number of proposers based on the percentage
+            // If total_validators is 0, set required_proposers to u32::MAX to prevent accidental passing
+            let required_proposers = if total_validators == 0 {
+                u32::MAX
+            } else {
+                // Round up to ensure at least 1 if percentage > 0
+                ((total_validators * min_consensus_percentage + 99) / 100).max(1)
+            };
+
             // For each issuer in IssuerMap
             for (domain, issuer) in IssuerMap::<T>::iter() {
                 // Get the current counter for this issuer
                 if let Some(interval) = issuer.interval_update {
                     CounterIntervalUpdateIssuer::<T>::mutate(&domain, |counter| {
                         *counter = (*counter + 1) % interval; // Increase counter by one
-                        if interval == *counter && issuer.is_enabled && interval > 0 {
+                        if 0 == *counter && issuer.is_enabled && interval > 0 {
                             // Only proceed if counter was zero (i.e., time to process)
-                            // Check if DomainAccsVec count >= MinimalConsensusPercentage
-                            let min_consensus = T::MinimalConsensusPercentage::get();
+                            // Check if DomainAccsVec count >= required_proposers
                             if let Some(accs_vec) = DomainAccsVec::<T>::get(&domain) {
-                                if accs_vec.len() as u32 >= min_consensus {
+                                if accs_vec.len() as u32 >= required_proposers {
                                     // Find the Hash with the greatest value in CounterProposedJwksHash
                                     let mut max_count = 0u32;
                                     let mut selected_hash = None;
@@ -819,40 +855,44 @@ pub mod pallet {
             // Get validator account from keystore
             let signer = Signer::<T, T::AuthorityId>::any_account();
 
-            // Iterate on all the registered issuers
-            for issuer in IssuerMap::<T>::iter() {
-                // Check if issuer is disabled
-                if !issuer.1.is_enabled || issuer.1.interval_update.is_none() {
-                    continue;
-                }
+            if !signer.can_sign() {
+                // Iterate on all the registered issuers
+                for issuer in IssuerMap::<T>::iter() {
+                    // Check if issuer is disabled
+                    if !issuer.1.is_enabled || issuer.1.interval_update.is_none() {
+                        continue;
+                    }
 
-                // Process this issuer
-                let url = &issuer.1.url;
-                let url_type = &issuer.1.url_type;
+                    // Process this issuer
+                    let url = &issuer.1.url;
+                    let url_type = &issuer.1.url_type;
 
-                if let Ok(url_str) = sp_std::str::from_utf8(url.as_slice()) {
-                    if let Ok(fetched_jwks) = Self::fetch_jwks(url_str, url_type.clone()) {
-                        if false == Self::is_same_jwks_as_before(&signer, &issuer.0, &fetched_jwks)
-                        {
-                            let res = Self::new_propose(&signer, &issuer.0.clone(), fetched_jwks);
-                            if let Err(e) = res {
-                                log::error!(
-                                    "Failed to propose JWKS for domain {:?}: {:?}",
-                                    issuer.0,
-                                    e
+                    if let Ok(url_str) = sp_std::str::from_utf8(url.as_slice()) {
+                        if let Ok(fetched_jwks) = Self::fetch_jwks(url_str, url_type.clone()) {
+                            if false
+                                == Self::is_same_jwks_as_before(&signer, &issuer.0, &fetched_jwks)
+                            {
+                                let res =
+                                    Self::new_propose(&signer, &issuer.0.clone(), fetched_jwks);
+                                if let Err(e) = res {
+                                    log::error!(
+                                        "Failed to propose JWKS for domain {:?}: {:?}",
+                                        issuer.0,
+                                        e
+                                    );
+                                }
+                            } else {
+                                log::info!(
+                                    "Already proposed same jwks for that domain, not needed to propose again."
                                 );
                             }
                         } else {
-                            log::info!(
-                                "Already proposed same jwks for that domain, not needed to propose again."
+                            log::error!(
+                                "Failed to fetch JWKS for domain {:?} with url {:?}",
+                                issuer.0,
+                                url_str
                             );
                         }
-                    } else {
-                        log::error!(
-                            "Failed to fetch JWKS for domain {:?} with url {:?}",
-                            issuer.0,
-                            url_str
-                        );
                     }
                 }
             }
@@ -948,7 +988,6 @@ impl<T: Config> Pallet<T> {
     }
 
     fn fetch_jwks(
-        // ToDo: optimize memory usage -> avoid clones and json Value usages.
         url: &str,
         url_type: UrlType,
     ) -> Result<BoundedVec<u8, T::MaxLengthIssuerJWKS>, http::Error> {
@@ -997,17 +1036,10 @@ impl<T: Config> Pallet<T> {
     }
 
     fn new_propose(
-        // ToDo: optimize memory usage -> avoid clones and json Value usages.
         signer: &Signer<T, T::AuthorityId>,
         domain: &BoundedVec<u8, T::MaxLengthIssuerDomain>,
         jwks: BoundedVec<u8, T::MaxLengthIssuerJWKS>,
     ) -> Result<(), http::Error> {
-        // ToDo: Is needed some result handling?
-        // ToDo: Search the H256(jwks) for the signer to check if already proposed this recently
-        // ToDo: Store in local storage the jwks proposed to avoid propose already proposed values.
-
-        // 4. Propose the JWKS
-        // Send extrinsic to propose_jwks using the validator account
         let _results = signer.send_signed_transaction(move |_account| Call::propose_jwks {
             domain: domain.clone(),
             jwks: jwks.clone(),
