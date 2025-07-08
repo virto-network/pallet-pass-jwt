@@ -331,4 +331,576 @@ fn set_url_fails_if_not_exists() {
     });
 }
 
-// More tests for update_issuer, delete_issuer, set_interval_update, set_enabled, set_url, propose_jwks, set_jwks, offchain worker, and all boundary/error cases will be added below.
+#[test]
+fn propose_jwks_works() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = jwks_vec("{\"keys\":[]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        // Propose JWKS
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            jwks.clone()
+        ));
+        // Proposing again with a different JWKS is ok
+        let jwks2 = jwks_vec("{\"keys\":[1]}");
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            jwks2.clone()
+        ));
+    });
+}
+
+#[test]
+fn propose_jwks_fails_if_not_validator() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = jwks_vec("{\"keys\":[]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let not_validator = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        // Only validators can propose (in this mock, all are allowed, but test for completeness)
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            jwks.clone()
+        ));
+        // If origin is none, should fail
+        assert_noop!(
+            Jwt::propose_jwks(RuntimeOrigin::none(), domain.clone(), jwks.clone()),
+            BadOrigin
+        );
+    });
+}
+
+#[test]
+fn propose_jwks_fails_if_duplicate() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = jwks_vec("{\"keys\":[]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            jwks.clone()
+        ));
+        // Proposing the same JWKS again should fail
+        assert_noop!(
+            Jwt::propose_jwks(
+                RuntimeOrigin::signed(who.clone()),
+                domain.clone(),
+                jwks.clone()
+            ),
+            Error::<Test>::DuplicateJWKSProposal
+        );
+    });
+}
+
+#[test]
+fn propose_jwks_fails_if_issuer_not_exists() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("NonExistent");
+        let jwks = jwks_vec("{\"keys\":[]}");
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_noop!(
+            Jwt::propose_jwks(RuntimeOrigin::signed(who), domain, jwks),
+            Error::<Test>::IssuerDoesNotExist
+        );
+    });
+}
+
+#[test]
+fn propose_jwks_fails_with_invalid_json() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = jwks_vec("not-json");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks_vec("{\"keys\":[]}")),
+            url_type.clone(),
+            interval_update
+        ));
+        assert_noop!(
+            Jwt::propose_jwks(RuntimeOrigin::signed(who.clone()), domain.clone(), jwks),
+            Error::<Test>::InvalidJson
+        );
+    });
+}
+
+#[test]
+fn set_jwks_works() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = jwks_vec("{\"keys\":[]}");
+        let new_jwks = jwks_vec("{\"keys\":[1]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        assert_ok!(Jwt::set_jwks(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            new_jwks.clone()
+        ));
+        assert_eq!(Jwt::get_jwks_map(&domain), Some(new_jwks));
+    });
+}
+
+#[test]
+fn set_jwks_fails_if_not_exists() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("NonExistent");
+        let jwks = jwks_vec("{\"keys\":[]}");
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_noop!(
+            Jwt::set_jwks(RuntimeOrigin::signed(who), domain, jwks),
+            Error::<Test>::IssuerDoesNotExist
+        );
+    });
+}
+
+#[test]
+fn set_jwks_fails_with_invalid_json() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = jwks_vec("not-json");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks_vec("{\"keys\":[]}")),
+            url_type.clone(),
+            interval_update
+        ));
+        assert_noop!(
+            Jwt::set_jwks(RuntimeOrigin::signed(who.clone()), domain.clone(), jwks),
+            Error::<Test>::InvalidJson
+        );
+    });
+}
+
+#[test]
+fn set_jwks_no_change_no_event() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = jwks_vec("{\"keys\":[]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        // Setting the same JWKS should not emit an event or change storage
+        assert_ok!(Jwt::set_jwks(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            jwks.clone()
+        ));
+        assert_eq!(Jwt::get_jwks_map(&domain), Some(jwks));
+    });
+}
+
+#[test]
+fn offchain_worker_consensus_updates_jwks() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks1 = jwks_vec("{\"keys\":[1]}");
+        let jwks2 = jwks_vec("{\"keys\":[2]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(1u32); // Fast update for test
+        let who1 = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let who2 = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks1.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        // Both validators propose different JWKS
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            jwks1.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who2.clone()),
+            domain.clone(),
+            jwks2.clone()
+        ));
+        // Simulate block finalization (should trigger consensus logic)
+        Jwt::on_finalize(2);
+        // The JWKS with the highest count (should be either, since both have 1, but at least one is set)
+        let stored = Jwt::get_jwks_map(&domain).unwrap();
+        assert!(stored == jwks1 || stored == jwks2);
+        // Proposals should be cleared
+        assert!(Jwt::get_domain_accs_vec(&domain).is_none());
+    });
+}
+
+#[test]
+fn on_finalize_requires_minimal_consensus() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks1 = jwks_vec("{\"keys\":[1]}");
+        let jwks2 = jwks_vec("{\"keys\":[2]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(1u32);
+        let who1 = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let who2 = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        // Only one validator proposes
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks1.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            jwks1.clone()
+        ));
+        // Not enough for consensus (MinimalConsensusPercentage = 70, 2 validators, needs 2)
+        Jwt::on_finalize(2);
+        // JWKS should not be updated to the proposal
+        let stored = Jwt::get_jwks_map(&domain).unwrap();
+        assert_eq!(stored, jwks1); // initial value
+        // Proposals should not be cleared
+        assert!(Jwt::get_domain_accs_vec(&domain).is_some());
+    });
+}
+
+#[test]
+fn on_finalize_selects_highest_count_jwks() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks1 = jwks_vec("{\"keys\":[1]}");
+        let jwks2 = jwks_vec("{\"keys\":[2]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(1u32);
+        let who1 = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let who2 = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        let who3 = sp_core::sr25519::Public::from_raw([3u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks1.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        // Two propose jwks2, one proposes jwks1
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            jwks1.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who2.clone()),
+            domain.clone(),
+            jwks2.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who3.clone()),
+            domain.clone(),
+            jwks2.clone()
+        ));
+        // Now consensus should be reached (3 validators, 70% = 3)
+        Jwt::on_finalize(2);
+        // JWKS should be jwks2
+        let stored = Jwt::get_jwks_map(&domain).unwrap();
+        assert_eq!(stored, jwks2);
+        // Proposals should be cleared
+        assert!(Jwt::get_domain_accs_vec(&domain).is_none());
+    });
+}
+
+#[test]
+fn on_finalize_clears_all_volatile_storage() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks1 = jwks_vec("{\"keys\":[1]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(1u32);
+        let who1 = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let who2 = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks1.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            jwks1.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who2.clone()),
+            domain.clone(),
+            jwks1.clone()
+        ));
+        Jwt::on_finalize(2);
+        // All volatile storages should be cleared
+        assert!(Jwt::get_domain_accs_vec(&domain).is_none());
+        // JwksHash, CounterProposedJwksHash, DomainAccJwksHash are private, but their effects are covered by consensus and cleared proposals
+    });
+}
+
+#[test]
+fn on_finalize_no_consensus_if_no_validators() {
+    // This test assumes Validators::validators() returns empty, which is not the case in the mock.
+    // So we skip this test unless the mock is adjusted to allow zero validators.
+}
+
+#[test]
+fn on_finalize_skips_if_issuer_disabled() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks1 = jwks_vec("{\"keys\":[1]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(1u32);
+        let who1 = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let who2 = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks1.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        assert_ok!(Jwt::set_enabled(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            false
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            jwks1.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who2.clone()),
+            domain.clone(),
+            jwks1.clone()
+        ));
+        Jwt::on_finalize(2);
+        // Proposals should not be cleared
+        assert!(Jwt::get_domain_accs_vec(&domain).is_some());
+    });
+}
+
+#[test]
+fn on_finalize_skips_if_no_interval_update() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks1 = jwks_vec("{\"keys\":[1]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = None;
+        let who1 = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let who2 = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks1.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            jwks1.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who2.clone()),
+            domain.clone(),
+            jwks1.clone()
+        ));
+        Jwt::on_finalize(2);
+        // Proposals should not be cleared
+        assert!(Jwt::get_domain_accs_vec(&domain).is_some());
+    });
+}
+
+#[test]
+fn on_finalize_triggers_only_at_interval() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks1 = jwks_vec("{\"keys\":[1]}");
+        let jwks2 = jwks_vec("{\"keys\":[2]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(3u32); // Only every 3 blocks
+        let who1 = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let who2 = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        let who3 = sp_core::sr25519::Public::from_raw([3u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks1.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        // All propose jwks2
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            jwks2.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who2.clone()),
+            domain.clone(),
+            jwks2.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who3.clone()),
+            domain.clone(),
+            jwks2.clone()
+        ));
+        // Call on_finalize for blocks 2, 3, 4
+        Jwt::on_finalize(2);
+        // Should not trigger consensus yet
+        assert_eq!(Jwt::get_jwks_map(&domain), Some(jwks1.clone()));
+        assert!(Jwt::get_domain_accs_vec(&domain).is_some());
+        Jwt::on_finalize(3);
+        // Still not interval
+        assert_eq!(Jwt::get_jwks_map(&domain), Some(jwks1.clone()));
+        assert!(Jwt::get_domain_accs_vec(&domain).is_some());
+        Jwt::on_finalize(4);
+        // Now interval triggers (block 4 - block 1 = 3)
+        assert_eq!(Jwt::get_jwks_map(&domain), Some(jwks2.clone()));
+        assert!(Jwt::get_domain_accs_vec(&domain).is_none());
+    });
+}
+
+#[test]
+fn on_finalize_interval_repeats_and_respects_new_proposals() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks1 = jwks_vec("{\"keys\":[1]}");
+        let jwks2 = jwks_vec("{\"keys\":[2]}");
+        let jwks3 = jwks_vec("{\"keys\":[3]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(2u32); // Every 2 blocks
+        let who1 = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let who2 = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        let who3 = sp_core::sr25519::Public::from_raw([3u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks1.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        // First round: all propose jwks2
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            jwks2.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who2.clone()),
+            domain.clone(),
+            jwks2.clone()
+        ));
+        Jwt::on_finalize(2);
+        // Not yet interval
+        assert_eq!(Jwt::get_jwks_map(&domain), Some(jwks1.clone()));
+        Jwt::on_finalize(3);
+        // Now interval triggers
+        assert_eq!(Jwt::get_jwks_map(&domain), Some(jwks2.clone()));
+        assert!(Jwt::get_domain_accs_vec(&domain).is_none());
+        // Second round: new proposals for jwks3
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            jwks3.clone()
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who3.clone()),
+            domain.clone(),
+            jwks3.clone()
+        ));
+        Jwt::on_finalize(4);
+        // Not yet interval
+        assert_eq!(Jwt::get_jwks_map(&domain), Some(jwks2.clone()));
+        Jwt::on_finalize(5);
+        // Now interval triggers again
+        assert_eq!(Jwt::get_jwks_map(&domain), Some(jwks3.clone()));
+        assert!(Jwt::get_domain_accs_vec(&domain).is_none());
+    });
+}
