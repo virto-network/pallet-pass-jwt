@@ -2,42 +2,42 @@
 
 #![cfg(test)]
 
-use crate as pallet_jwt;
+use crate::*;
+use crate::{self as pallet_jwt, crypto};
 
-use codec::{Decode, Encode};
 use frame_support::{
     derive_impl,
     parameter_types,
     runtime, // `#[runtime]` proc-macro
-    traits::{ConstU32, ConstU64, Everything},
-    weights::constants::RocksDbWeight,
+    traits::{ConstU32, ConstU64},
 };
-use frame_system::{
-    mocking::MockBlock,
-    offchain::{AppCrypto, CreateSignedTransaction, CreateTransactionBase, SigningTypes},
-};
+
+// use frame_system::offchain;
+
 use pallet_session;
-use scale_info::TypeInfo;
-use sp_application_crypto::{AppPublic, AppSignature};
+use sp_runtime::{BuildStorage, testing::UintAuthorityId};
 use sp_runtime::{
-    BuildStorage, generic::UncheckedExtrinsic, testing::UintAuthorityId,
-    transaction_validity::TransactionValidity,
+    testing::TestXt,
+    traits::{BlakeTwo256, IdentifyAccount, IdentityLookup, Verify},
 };
+
+use sp_core::{H256, sr25519::Signature};
+
+type Block = frame_system::mocking::MockBlock<Test>;
 
 // ─────────────────────────────────────────
 // Type aliases
 // ─────────────────────────────────────────
-pub type AccountId = u64;
+type AccountId = <<Signature as Verify>::Signer as IdentifyAccount>::AccountId;
 pub type Balance = u128;
 pub type BlockNumber = u32;
-pub type Signature = UintAuthorityId;
 pub type Public = UintAuthorityId;
 
 // ─────────────────────────────────────────
 // Test runtime
 // ─────────────────────────────────────────
 #[runtime]
-mod test_runtime {
+mod runtime {
     #[runtime::runtime]
     #[runtime::derive(
         RuntimeCall,
@@ -69,14 +69,14 @@ mod test_runtime {
 parameter_types! {
     pub const BlockHashCount: u64             = 250;
     pub const MaxLengthIssuerDomain: u32      = 100;
-    pub const MaxLengthIssuerOpenIdURL: u32   = 200;
+    pub const MaxLengthIssuerURL: u32   = 200;
     pub const MaxLengthIssuerJWKS: u32        = 1_000;
     pub const MinUpdateInterval: u32          = 10;
     pub const MaxUpdateInterval: u32          = 1_000;
     pub const MaxProposersPerIssuer: u32      = 10;
     pub const ExistentialDeposit: Balance     = 1;
 
-    pub const MinimalConsensusValidatorsPercentage: u32 = 70;
+    pub const MinimalConsensusPercentage: u32 = 70;
 }
 
 // ─────────────────────────────────────────
@@ -84,12 +84,27 @@ parameter_types! {
 // ─────────────────────────────────────────
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
-    type AccountId = AccountId;
-    type BaseCallFilter = Everything;
-    type Block = MockBlock<Test>;
-    type BlockHashCount = BlockHashCount;
-    type DbWeight = RocksDbWeight;
+    type BaseCallFilter = frame_support::traits::Everything;
+    type BlockWeights = ();
+    type BlockLength = ();
+    type DbWeight = ();
+    type RuntimeOrigin = RuntimeOrigin;
+    type RuntimeCall = RuntimeCall;
+    type Nonce = u64;
+    type Hash = H256;
+    type Hashing = BlakeTwo256;
+    type AccountId = sp_core::sr25519::Public;
+    type Lookup = IdentityLookup<Self::AccountId>;
+    type Block = Block;
+    type RuntimeEvent = RuntimeEvent;
+    type Version = ();
+    type PalletInfo = PalletInfo;
     type AccountData = pallet_balances::AccountData<Balance>;
+    type OnNewAccount = ();
+    type OnKilledAccount = ();
+    type SystemWeightInfo = ();
+    type SS58Prefix = ();
+    type OnSetCode = ();
     type MaxConsumers = ConstU32<16>;
 }
 
@@ -119,33 +134,43 @@ impl pallet_session::Config for Test {
     type DisablingStrategy = ();
 }
 
+type Extrinsic = TestXt<RuntimeCall, ()>;
+
 // ─────────────────────────────────────────
 // SigningTypes implementation
 // ─────────────────────────────────────────
-impl SigningTypes for Test {
-    type Public = Public;
+impl frame_system::offchain::SigningTypes for Test {
+    type Public = <Signature as Verify>::Signer;
     type Signature = Signature;
 }
 
 // ─────────────────────────────────────────
 // CreateTransactionBase implementation
 // ─────────────────────────────────────────
-impl CreateTransactionBase<pallet_jwt::Call<Test>> for Test {
-    type Extrinsic = sp_runtime::testing::TestXt<pallet_jwt::Call<Test>, ()>;
-    type RuntimeCall = pallet_jwt::Call<Test>;
+impl<LocalCall> frame_system::offchain::CreateTransactionBase<LocalCall> for Test
+where
+    RuntimeCall: From<LocalCall>,
+{
+    type RuntimeCall = RuntimeCall;
+    type Extrinsic = Extrinsic;
 }
 
 // ─────────────────────────────────────────
 // CreateSignedTransaction implementation
 // ─────────────────────────────────────────
-impl CreateSignedTransaction<pallet_jwt::Call<Test>> for Test {
-    fn create_signed_transaction<C: AppCrypto<Self::Public, Self::Signature>>(
-        call: pallet_jwt::Call<Test>,
-        _public: Self::Public,
-        _account: Self::AccountId,
-        _nonce: u32,
-    ) -> Option<UncheckedExtrinsic<u64, pallet_jwt::Call<Test>, (), ()>> {
-        None
+impl<LocalCall> frame_system::offchain::CreateSignedTransaction<LocalCall> for Test
+where
+    RuntimeCall: From<LocalCall>,
+{
+    fn create_signed_transaction<
+        C: frame_system::offchain::AppCrypto<Self::Public, Self::Signature>,
+    >(
+        call: RuntimeCall,
+        _public: <Signature as Verify>::Signer,
+        _account: AccountId,
+        nonce: u64,
+    ) -> Option<Extrinsic> {
+        Some(Extrinsic::new_signed(call, nonce, (), ()))
     }
 }
 
@@ -156,18 +181,19 @@ impl pallet_jwt::Config for Test {
     type RuntimeEvent = RuntimeEvent;
     type BlockNumber = BlockNumber;
     type MaxLengthIssuerDomain = MaxLengthIssuerDomain;
-    type MaxLengthIssuerOpenIdURL = MaxLengthIssuerOpenIdURL;
+    type MaxLengthIssuerURL = MaxLengthIssuerURL;
     type MaxLengthIssuerJWKS = MaxLengthIssuerJWKS;
     type MinUpdateInterval = MinUpdateInterval;
     type MaxUpdateInterval = MaxUpdateInterval;
     type MaxProposersPerIssuer = MaxProposersPerIssuer;
     type RegisterOrigin = frame_system::EnsureSigned<AccountId>;
     type UpdaterOrigin = frame_system::EnsureSigned<AccountId>;
+    type ProposerOrigin = frame_system::EnsureSigned<AccountId>;
     type JwtOrigin = RuntimeOrigin;
     type Validators = pallet_session::Pallet<Test>;
     type NativeBalance = Balances;
-    type AuthorityId = UintAuthorityId;
-    type MinimalConsensusValidatorsPercentage = MinimalConsensusValidatorsPercentage;
+    type AuthorityId = crypto::TestAuthId;
+    type MinimalConsensusPercentage = MinimalConsensusPercentage;
 }
 
 // ─────────────────────────────────────────
@@ -178,17 +204,20 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
     // use frame_support::traits::BuildGenesisConfig;
 
     // System genesis
-    let mut storage = frame_system::GenesisConfig::<Test>::default()
+    let storage = frame_system::GenesisConfig::<Test>::default()
         .build_storage()
         .unwrap();
 
-    // Balances genesis (now with `dev_accounts`)
-    pallet_balances::GenesisConfig::<Test> {
-        balances: vec![(1, 1_000_000_000_000), (2, 1_000_000_000_000)],
-        dev_accounts: None,
-    }
-    .assimilate_storage(&mut storage)
-    .unwrap();
+    // // Balances genesis (now with `dev_accounts`)
+    // pallet_balances::GenesisConfig::<Test> {
+    //     balances: vec![
+    //         (sp_core::sr25519::Public::from_raw([1u8; 32]), 1_000_000_000_000),
+    //         (sp_core::sr25519::Public::from_raw([2u8; 32]), 1_000_000_000_000),
+    //     ],
+    //     dev_accounts: None,
+    // }
+    // .assimilate_storage(&mut storage)
+    // .unwrap();
 
     // Start every test at block 1
     let mut ext = sp_io::TestExternalities::new(storage);
