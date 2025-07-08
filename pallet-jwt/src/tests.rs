@@ -904,3 +904,201 @@ fn on_finalize_interval_repeats_and_respects_new_proposals() {
         assert!(Jwt::get_domain_accs_vec(&domain).is_none());
     });
 }
+
+#[test]
+fn propose_jwks_fails_if_max_proposers_exceeded() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = jwks_vec("{\"keys\":[]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who1 = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        let who2 = sp_core::sr25519::Public::from_raw([2u8; 32]);
+        let who3 = sp_core::sr25519::Public::from_raw([3u8; 32]);
+        let who4 = sp_core::sr25519::Public::from_raw([4u8; 32]);
+        let who5 = sp_core::sr25519::Public::from_raw([5u8; 32]);
+        let who6 = sp_core::sr25519::Public::from_raw([6u8; 32]);
+        let who7 = sp_core::sr25519::Public::from_raw([7u8; 32]);
+        let who8 = sp_core::sr25519::Public::from_raw([8u8; 32]);
+        let who9 = sp_core::sr25519::Public::from_raw([9u8; 32]);
+        let who10 = sp_core::sr25519::Public::from_raw([10u8; 32]);
+        let who11 = sp_core::sr25519::Public::from_raw([11u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who1.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        let all = [who1, who2, who3, who4, who5, who6, who7, who8, who9, who10];
+        for who in &all {
+            assert_ok!(Jwt::propose_jwks(
+                RuntimeOrigin::signed(who.clone()),
+                domain.clone(),
+                jwks.clone()
+            ));
+        }
+        // 11th proposer should fail
+        assert_noop!(
+            Jwt::propose_jwks(RuntimeOrigin::signed(who11), domain.clone(), jwks.clone()),
+            Error::<Test>::MaxProposersPerIssuerExceeded
+        );
+    });
+}
+
+#[test]
+fn propose_jwks_fails_if_json_too_long() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = vec![b'a'; 2000]; // Exceeds MaxLengthIssuerJWKS
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks_vec("{\"keys\":[]}")),
+            url_type.clone(),
+            interval_update
+        ));
+        assert!(BoundedVec::<u8, MaxLengthIssuerJWKS>::try_from(jwks).is_err());
+    });
+}
+
+#[test]
+fn register_issuer_fails_if_jwks_too_long() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = vec![b'a'; 2000]; // Exceeds MaxLengthIssuerJWKS
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert!(BoundedVec::<u8, MaxLengthIssuerJWKS>::try_from(jwks).is_err());
+    });
+}
+
+#[test]
+fn register_issuer_fails_if_url_too_long() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = vec![b'a'; 201]; // Exceeds MaxLengthIssuerURL
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert!(BoundedVec::<u8, MaxLengthIssuerURL>::try_from(url).is_err());
+    });
+}
+
+#[test]
+fn register_issuer_fails_if_domain_too_long() {
+    new_test_ext().execute_with(|| {
+        let domain = vec![b'a'; 101]; // Exceeds MaxLengthIssuerDomain
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert!(BoundedVec::<u8, MaxLengthIssuerDomain>::try_from(domain).is_err());
+    });
+}
+
+#[test]
+fn update_issuer_fails_if_jwks_too_long() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = Some(jwks_vec("{\"keys\":[]}"));
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            jwks.clone(),
+            url_type.clone(),
+            interval_update
+        ));
+        assert!(BoundedVec::<u8, MaxLengthIssuerJWKS>::try_from(vec![b'a'; 2000]).is_err());
+    });
+}
+
+#[test]
+fn update_issuer_fails_if_url_too_long() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = Some(jwks_vec("{\"keys\":[]}"));
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            jwks.clone(),
+            url_type.clone(),
+            interval_update
+        ));
+        assert!(BoundedVec::<u8, MaxLengthIssuerURL>::try_from(vec![b'a'; 201]).is_err());
+    });
+}
+
+#[test]
+fn update_issuer_fails_if_domain_too_long() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = Some(jwks_vec("{\"keys\":[]}"));
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            jwks.clone(),
+            url_type.clone(),
+            interval_update
+        ));
+        assert!(BoundedVec::<u8, MaxLengthIssuerDomain>::try_from(vec![b'a'; 101]).is_err());
+    });
+}
+
+#[test]
+fn propose_jwks_fails_if_already_proposed_for_jwks() {
+    new_test_ext().execute_with(|| {
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = jwks_vec("{\"keys\":[]}");
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
+        assert_ok!(Jwt::register_issuer(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            url.clone(),
+            Some(jwks.clone()),
+            url_type.clone(),
+            interval_update
+        ));
+        assert_ok!(Jwt::propose_jwks(
+            RuntimeOrigin::signed(who.clone()),
+            domain.clone(),
+            jwks.clone()
+        ));
+        // Proposing the same JWKS again should fail
+        assert_noop!(
+            Jwt::propose_jwks(
+                RuntimeOrigin::signed(who.clone()),
+                domain.clone(),
+                jwks.clone()
+            ),
+            Error::<Test>::DuplicateJWKSProposal
+        );
+    });
+}
