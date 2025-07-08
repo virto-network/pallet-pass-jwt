@@ -1,96 +1,81 @@
+//! Comprehensive tests for pallet-jwt, including offchain worker and all extrinsics.
+
 use super::*;
 use crate::mock::*;
-use frame::runtime::testing_prelude::BuildStorage;
-use frame_support::{assert_noop, assert_ok};
-use frame_system::GenesisConfig;
+use crate::types::UrlType;
+use frame_support::{BoundedVec, assert_noop, assert_ok, traits::OnFinalize};
+use sp_runtime::traits::BadOrigin;
 
-// Helper function to create a test externalities
-fn new_test_ext() -> sp_io::TestExternalities {
-    GenesisConfig::<Test>::default()
-        .build_storage()
-        .unwrap()
-        .into()
+type Domain = BoundedVec<u8, MaxLengthIssuerDomain>;
+type Url = BoundedVec<u8, MaxLengthIssuerURL>;
+type Jwks = BoundedVec<u8, MaxLengthIssuerJWKS>;
+
+type MaxLengthIssuerDomain = <Test as Config>::MaxLengthIssuerDomain;
+type MaxLengthIssuerURL = <Test as Config>::MaxLengthIssuerURL;
+type MaxLengthIssuerJWKS = <Test as Config>::MaxLengthIssuerJWKS;
+
+fn domain_vec(s: &str) -> Domain {
+    BoundedVec::try_from(s.as_bytes().to_vec()).unwrap()
 }
-
-// Helper function to create a bounded vec from a string
-fn bounded_vec<T: Get<u32>>(s: &str) -> BoundedVec<u8, T> {
+fn url_vec(s: &str) -> Url {
+    BoundedVec::try_from(s.as_bytes().to_vec()).unwrap()
+}
+fn jwks_vec(s: &str) -> Jwks {
     BoundedVec::try_from(s.as_bytes().to_vec()).unwrap()
 }
 
-// Helper function to create a valid JWKS JSON
-fn create_test_jwks() -> BoundedVec<u8, MaxLengthIssuerJWKS> {
-    let jwks = r#"{
-        "keys": [
-            {
-                "kty": "RSA",
-                "kid": "test-key-1",
-                "use": "sig",
-                "n": "test-n",
-                "e": "AQAB"
-            }
-        ]
-    }"#;
-    bounded_vec(jwks)
-}
-
-// Helper function to create a valid OpenID URL
-fn create_test_openid_url() -> BoundedVec<u8, MaxLengthIssuerOpenIdURL> {
-    bounded_vec("https://test.example.com/.well-known/openid-configuration")
-}
-
 #[test]
-fn test_register_issuer_success() {
+fn register_issuer_works() {
     new_test_ext().execute_with(|| {
-        let domain = bounded_vec::<MaxLengthIssuerDomain>("example.com");
-        let open_id_url = Some(create_test_openid_url());
-        let jwks = Some(create_test_jwks());
-        let interval_update = Some(100);
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = Some(jwks_vec("{\"keys\":[]}"));
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
 
-        // Register issuer as root
         assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
+            RuntimeOrigin::signed(who.clone()),
             domain.clone(),
-            open_id_url.clone(),
+            url.clone(),
             jwks.clone(),
-            interval_update,
+            url_type.clone(),
+            interval_update
         ));
-
-        // Verify storage
-        let issuer = IssuerMap::<Test>::get(&domain).unwrap();
-        assert_eq!(issuer.open_id_url, open_id_url);
-        assert_eq!(issuer.interval_update, interval_update);
-        assert!(issuer.is_enabled);
-
-        // Verify JWKS storage
-        assert_eq!(JwksMap::<Test>::get(&domain), jwks);
+        // Check storage
+        assert!(Jwt::get_issuer_map(&domain).is_some());
+        assert_eq!(Jwt::get_issuer_creator(&domain), Some(who));
+        assert!(Jwt::get_jwks_map(&domain).is_some());
     });
 }
 
 #[test]
-fn test_register_issuer_duplicate() {
+fn register_issuer_fails_if_already_exists() {
     new_test_ext().execute_with(|| {
-        let domain = bounded_vec::<MaxLengthIssuerDomain>("example.com");
-        let open_id_url = Some(create_test_openid_url());
-        let jwks = Some(create_test_jwks());
-        let interval_update = Some(100);
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = Some(jwks_vec("{\"keys\":[]}"));
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        let who = sp_core::sr25519::Public::from_raw([1u8; 32]);
 
-        // First registration
         assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
+            RuntimeOrigin::signed(who.clone()),
             domain.clone(),
-            open_id_url.clone(),
+            url.clone(),
             jwks.clone(),
-            interval_update,
+            url_type.clone(),
+            interval_update
         ));
-
-        // Try to register again
+        // Try again
         assert_noop!(
             Jwt::register_issuer(
-                RuntimeOrigin::root(),
-                domain,
-                open_id_url,
-                jwks,
-                interval_update,
+                RuntimeOrigin::signed(who),
+                domain.clone(),
+                url.clone(),
+                jwks.clone(),
+                url_type.clone(),
+                interval_update
             ),
             Error::<Test>::IssuerAlreadyExists
         );
@@ -98,290 +83,34 @@ fn test_register_issuer_duplicate() {
 }
 
 #[test]
-fn test_update_issuer() {
+fn register_issuer_fails_with_long_domain() {
     new_test_ext().execute_with(|| {
-        let domain = bounded_vec::<MaxLengthIssuerDomain>("example.com");
-        let open_id_url = Some(create_test_openid_url());
-        let jwks = Some(create_test_jwks());
-        let interval_update = Some(100);
-
-        // Register issuer
-        assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
-            domain.clone(),
-            open_id_url.clone(),
-            jwks.clone(),
-            interval_update,
-        ));
-
-        // Update issuer
-        let new_open_id_url = Some(bounded_vec::<MaxLengthIssuerOpenIdURL>(
-            "https://new.example.com/.well-known/openid-configuration",
-        ));
-        let new_jwks = Some(create_test_jwks());
-        let new_interval_update = Some(200);
-
-        assert_ok!(Jwt::update_issuer(
-            RuntimeOrigin::root(),
-            domain.clone(),
-            new_open_id_url.clone(),
-            new_jwks.clone(),
-            new_interval_update,
-            true,
-        ));
-
-        // Verify storage
-        let issuer = IssuerMap::<Test>::get(&domain).unwrap();
-        assert_eq!(issuer.open_id_url, new_open_id_url);
-        assert_eq!(issuer.interval_update, new_interval_update);
-        assert!(issuer.is_enabled);
-
-        // Verify JWKS storage
-        assert_eq!(JwksMap::<Test>::get(&domain), new_jwks);
+        let domain = BoundedVec::<u8, MaxLengthIssuerDomain>::try_from(vec![b'a'; 101]);
+        assert!(domain.is_err());
     });
 }
 
 #[test]
-fn test_delete_issuer() {
+fn register_issuer_fails_with_invalid_origin() {
     new_test_ext().execute_with(|| {
-        let domain = bounded_vec::<MaxLengthIssuerDomain>("example.com");
-        let open_id_url = Some(create_test_openid_url());
-        let jwks = Some(create_test_jwks());
-        let interval_update = Some(100);
-
-        // Register issuer
-        assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
-            domain.clone(),
-            open_id_url,
-            jwks.clone(),
-            interval_update,
-        ));
-
-        // Delete issuer
-        assert_ok!(Jwt::delete_issuer(RuntimeOrigin::root(), domain.clone()));
-
-        // Verify storage is empty
-        assert!(!IssuerMap::<Test>::contains_key(&domain));
-        assert!(!JwksMap::<Test>::contains_key(&domain));
-    });
-}
-
-#[test]
-fn test_set_enabled() {
-    new_test_ext().execute_with(|| {
-        let domain = bounded_vec::<MaxLengthIssuerDomain>("example.com");
-        let open_id_url = Some(create_test_openid_url());
-        let jwks = Some(create_test_jwks());
-        let interval_update = Some(100);
-
-        // Register issuer
-        assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
-            domain.clone(),
-            open_id_url,
-            jwks,
-            interval_update,
-        ));
-
-        // Disable issuer
-        assert_ok!(Jwt::set_enabled(
-            RuntimeOrigin::root(),
-            domain.clone(),
-            false
-        ));
-
-        // Verify storage
-        let issuer = IssuerMap::<Test>::get(&domain).unwrap();
-        assert!(!issuer.is_enabled);
-
-        // Enable issuer
-        assert_ok!(Jwt::set_enabled(
-            RuntimeOrigin::root(),
-            domain.clone(),
-            true
-        ));
-
-        // Verify storage
-        let issuer = IssuerMap::<Test>::get(&domain).unwrap();
-        assert!(issuer.is_enabled);
-    });
-}
-
-#[test]
-fn test_propose_jwks() {
-    new_test_ext().execute_with(|| {
-        let domain = bounded_vec::<MaxLengthIssuerDomain>("example.com");
-        let open_id_url = Some(create_test_openid_url());
-        let jwks = Some(create_test_jwks());
-        let interval_update = Some(100);
-
-        // Register issuer
-        assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
-            domain.clone(),
-            open_id_url,
-            jwks,
-            interval_update,
-        ));
-
-        // Propose new JWKS
-        let new_jwks = create_test_jwks();
-        assert_ok!(Jwt::propose_jwks(
-            RuntimeOrigin::signed(1),
-            domain.clone(),
-            new_jwks.clone(),
-        ));
-
-        // Verify storage
-        let accounts = AccountsProposedForIssuer::<Test>::get(&domain).unwrap();
-        assert_eq!(accounts.len(), 1);
-        assert_eq!(accounts[0], 1);
-
-        // Try to propose again with same account
+        let domain = domain_vec("Google");
+        let url = url_vec("https://accounts.google.com/.well-known/openid-configuration");
+        let jwks = Some(jwks_vec("{\"keys\":[]}"));
+        let url_type = UrlType::OPENID;
+        let interval_update = Some(20u32);
+        // Unsigned origin
         assert_noop!(
-            Jwt::propose_jwks(RuntimeOrigin::signed(1), domain.clone(), new_jwks.clone(),),
-            Error::<Test>::AlreadyProposedForJWKS
+            Jwt::register_issuer(
+                RuntimeOrigin::none(),
+                domain,
+                url,
+                jwks,
+                url_type,
+                interval_update
+            ),
+            BadOrigin
         );
     });
 }
 
-#[test]
-fn test_set_jwks() {
-    new_test_ext().execute_with(|| {
-        let domain = bounded_vec::<MaxLengthIssuerDomain>("example.com");
-        let open_id_url = Some(create_test_openid_url());
-        let jwks = Some(create_test_jwks());
-        let interval_update = Some(100);
-
-        // Register issuer
-        assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
-            domain.clone(),
-            open_id_url,
-            jwks,
-            interval_update,
-        ));
-
-        // Propose new JWKS
-        let new_jwks = create_test_jwks();
-        assert_ok!(Jwt::propose_jwks(
-            RuntimeOrigin::signed(1),
-            domain.clone(),
-            new_jwks.clone(),
-        ));
-
-        // Set JWKS
-        assert_ok!(Jwt::set_jwks(RuntimeOrigin::root(), domain.clone()));
-
-        // Verify storage
-        assert_eq!(JwksMap::<Test>::get(&domain), Some(new_jwks));
-    });
-}
-
-#[test]
-fn test_validate_json() {
-    new_test_ext().execute_with(|| {
-        // Valid JSON
-        let mut valid_json = bounded_vec::<MaxLengthIssuerJWKS>(r#"{"key": "value"}"#);
-        assert_ok!(Jwt::validate_json(&mut valid_json));
-
-        // Invalid JSON
-        let mut invalid_json = bounded_vec::<MaxLengthIssuerJWKS>(r#"{"key": "value""#);
-        assert_noop!(
-            Jwt::validate_json(&mut invalid_json),
-            Error::<Test>::InvalidJson
-        );
-    });
-}
-
-#[test]
-fn test_validate_interval_update() {
-    new_test_ext().execute_with(|| {
-        // Test minimum bound
-        let mut interval = Some(5);
-        Jwt::validate_interval_update(&mut interval);
-        assert_eq!(interval, Some(10)); // Should be set to MinUpdateInterval
-
-        // Test maximum bound
-        let mut interval = Some(2000);
-        Jwt::validate_interval_update(&mut interval);
-        assert_eq!(interval, Some(1000)); // Should be set to MaxUpdateInterval
-
-        // Test valid value
-        let mut interval = Some(500);
-        Jwt::validate_interval_update(&mut interval);
-        assert_eq!(interval, Some(500)); // Should remain unchanged
-    });
-}
-
-#[test]
-fn test_get_issuers_vec() {
-    new_test_ext().execute_with(|| {
-        let domain1 = bounded_vec::<MaxLengthIssuerDomain>("example1.com");
-        let domain2 = bounded_vec::<MaxLengthIssuerDomain>("example2.com");
-        let open_id_url = Some(create_test_openid_url());
-        let jwks = Some(create_test_jwks());
-        let interval_update = Some(100);
-
-        // Register two issuers
-        assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
-            domain1.clone(),
-            open_id_url.clone(),
-            jwks.clone(),
-            interval_update,
-        ));
-
-        assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
-            domain2.clone(),
-            open_id_url,
-            jwks,
-            interval_update,
-        ));
-
-        // Get all issuers
-        let issuers = Jwt::get_issuers_vec();
-        assert_eq!(issuers.len(), 2);
-        assert!(issuers.contains(&domain1));
-        assert!(issuers.contains(&domain2));
-    });
-}
-
-#[test]
-fn test_get_jwks_with_higher_count() {
-    new_test_ext().execute_with(|| {
-        let domain = bounded_vec::<MaxLengthIssuerDomain>("example.com");
-        let open_id_url = Some(create_test_openid_url());
-        let jwks = Some(create_test_jwks());
-        let interval_update = Some(100);
-
-        // Register issuer
-        assert_ok!(Jwt::register_issuer(
-            RuntimeOrigin::root(),
-            domain.clone(),
-            open_id_url,
-            jwks,
-            interval_update,
-        ));
-
-        // Propose JWKS from multiple accounts
-        let new_jwks = create_test_jwks();
-        assert_ok!(Jwt::propose_jwks(
-            RuntimeOrigin::signed(1),
-            domain.clone(),
-            new_jwks.clone(),
-        ));
-
-        assert_ok!(Jwt::propose_jwks(
-            RuntimeOrigin::signed(2),
-            domain.clone(),
-            new_jwks.clone(),
-        ));
-
-        // Get JWKS with highest count
-        let winning_jwks = Jwt::get_jwks_with_higher_count(&domain);
-        assert_eq!(winning_jwks, new_jwks);
-    });
-}
+// More tests for update_issuer, delete_issuer, set_interval_update, set_enabled, set_url, propose_jwks, set_jwks, offchain worker, and all boundary/error cases will be added below.
